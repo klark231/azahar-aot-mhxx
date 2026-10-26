@@ -57,14 +57,14 @@ class MainActivity : ComponentActivity() {
         var screen by remember { mutableStateOf(Screen.HOME) }
         var ready by remember { mutableIntStateOf(0) }   // bump to re-check files
         val gameOk = remember(ready) { Prefs.gameFile() != null }
-        val codeOk = remember(ready) { (File(Storage.aot, "0004000000126300.so").exists() || File(Storage.recomp, "0004000000126300.so").exists()) }
+        val codeOk = remember(ready) { (File(Storage.aot, "0004000000197100.so").exists() || File(Storage.recomp, "0004000000197100.so").exists()) }
 
         Column(Modifier.fillMaxSize().background(Mh4uColors.WindowBg).statusBarsPadding().navigationBarsPadding()) {
             Row(Modifier.fillMaxWidth().background(Mh4uColors.TitleBgActive).padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically) {
-                Text("MH4U", color = Mh4uColors.Amber, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text("MHXX", color = Mh4uColors.Amber, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.width(8.dp))
-                Text("Monster Hunter 4 Ultimate · port", color = Mh4uColors.TextDisabled, fontSize = 13.sp)
+                Text("Monster Hunter XX · port", color = Mh4uColors.TextDisabled, fontSize = 13.sp)
             }
             Tabs(Screen.entries.map { it.title }, screen.ordinal) { screen = Screen.entries[it] }
             Box(Modifier.weight(1f)) {
@@ -190,7 +190,7 @@ class MainActivity : ComponentActivity() {
             if (uri != null) scope.launch {
                 busy = "Copying the code library…"; progress = 0f; message = ""
                 // the core looks for <program id>.so in aot/ (3dsrecomp's libraries)
-                importTo(uri, Storage.aot, "0004000000126300.so")?.let { message = "Code library imported" }
+                importTo(uri, Storage.aot, "0004000000197100.so")?.let { message = "Code library imported" }
                 busy = ""; progress = -1f; changed()
             }
         }
@@ -220,21 +220,21 @@ class MainActivity : ComponentActivity() {
 
             SectionTitle("1 · Your game")
             Panel {
-                Check("Decrypted Monster Hunter 4 Ultimate (.3ds, .cci or .cxi)", gameOk, "Dump your own cartridge in decrypted form (for example with GodMode9).")
+                Check("Decrypted Monster Hunter XX (.3ds, .cci or .cxi)", gameOk, "Dump your own cartridge in decrypted form (for example with GodMode9).")
                 Hint("The app copies the file into its own storage.")
                 Spacer(Modifier.height(8.dp))
                 AmberButton(if (gameOk) "Choose another" else "Choose game", enabled = busy.isEmpty()) { pickGame.launch(arrayOf("*/*")) }
             }
             SectionTitle("2 · Code library")
             Panel {
-                Check("0004000000126300.so", codeOk, "Built on a PC from your own game dump. The app contains no game code.")
+                Check("0004000000197100.so", codeOk, "Built on a PC from your own game dump. The app contains no game code.")
                 Hint("On a PC with the Android NDK, run port/android/build-code-library.sh to build the arm64 library from your dump. Copy it to this device and select it here.")
                 Spacer(Modifier.height(8.dp))
                 AmberButton(if (codeOk) "Choose another" else "Choose library", enabled = busy.isEmpty()) { pickCode.launch(arrayOf("*/*")) }
             }
-            SectionTitle("3 · Update (v1.3.0)")
+            SectionTitle("3 · Update")
             Panel {
-                Hint("The port targets the USA 1.3.0 update. Install its .cia once; skip this step if it is already installed.")
+                Hint("Install the game's update .cia once (the same one the library was built with); skip this step if it is already installed.")
                 Spacer(Modifier.height(8.dp))
                 QuietButton("Install the update (.cia)", enabled = busy.isEmpty()) { pickCia.launch(arrayOf("*/*")) }
             }

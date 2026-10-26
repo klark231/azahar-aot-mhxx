@@ -18,7 +18,7 @@
         android:name=".App"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
-        android:label="MH4U"
+        android:label="MHXX"
         android:theme="@style/Theme.MH4U"
         android:extractNativeLibs="true">
 

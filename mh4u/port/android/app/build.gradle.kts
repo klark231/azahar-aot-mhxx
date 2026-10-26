@@ -14,7 +14,7 @@ android {
     ndkVersion = "27.3.13750724"
 
     defaultConfig {
-        applicationId = "org.mh4u.port"
+        applicationId = "org.mh4u.port.mhxx"
         minSdk = 29
         targetSdk = 35
         // CI passes its run number, so every build counts as newer than the last
