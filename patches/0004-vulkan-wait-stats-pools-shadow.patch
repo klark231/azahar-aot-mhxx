@@ -1,0 +1,293 @@
+diff -ruN a/src/video_core/rasterizer_cache/rasterizer_cache.h b/src/video_core/rasterizer_cache/rasterizer_cache.h
+--- a/src/video_core/rasterizer_cache/rasterizer_cache.h	2026-10-25 19:16:31.718756894 +0000
++++ b/src/video_core/rasterizer_cache/rasterizer_cache.h	2026-10-25 19:17:24.119091522 +0000
+@@ -554,8 +554,11 @@
+ 
+ template <class T>
+ typename T::Surface& RasterizerCache<T>::GetTextureSurface(
+-    const Pica::TexturingRegs::FullTextureConfig& config) {
+-    const auto info = Pica::Texture::TextureInfo::FromPicaRegister(config.config, config.format);
++    const Pica::TexturingRegs::FullTextureConfig& config, bool shadow_source) {
++    auto info = Pica::Texture::TextureInfo::FromPicaRegister(config.config, config.format);
++    if (shadow_source && PixelFormatFromTextureFormat(info.format) == PixelFormat::RGBA8) {
++        info.is_shadow_source = true;
++    }
+     const u32 max_level = MipLevels(info.width, info.height, config.config.lod.max_level) - 1;
+     const SurfaceId surface_id = GetTextureSurface(info, max_level);
+     return slot_surfaces[surface_id];
+@@ -745,8 +748,16 @@
+     Common::Rectangle<u32> color_rect{};
+     SurfaceId color_id{};
+     u32 color_level{};
+-    if (using_color_fb)
+-        std::tie(color_id, color_rect) = GetSurfaceSubRect(color_params, ScaleMatch::Exact, false);
++    if (using_color_fb) {
++        // Shadow rendering writes through an R32 storage view, so an RGBA8 target created for it
++        // must have storage usage (matters with AZAHAR_VK_NO_STORAGE, harmless otherwise).
++        SurfaceFlagBits color_flags{};
++        if (regs.framebuffer.IsShadowRendering() && color_params.pixel_format == PixelFormat::RGBA8) {
++            color_flags |= SurfaceFlagBits::ShadowSource;
++        }
++        std::tie(color_id, color_rect) =
++            GetSurfaceSubRect(color_params, ScaleMatch::Exact, false, color_flags);
++    }
+ 
+     Common::Rectangle<u32> depth_rect{};
+     SurfaceId depth_id{};
+diff -ruN a/src/video_core/rasterizer_cache/rasterizer_cache_base.h b/src/video_core/rasterizer_cache/rasterizer_cache_base.h
+--- a/src/video_core/rasterizer_cache/rasterizer_cache_base.h	2026-10-25 19:16:31.718786227 +0000
++++ b/src/video_core/rasterizer_cache/rasterizer_cache_base.h	2026-10-25 19:17:17.093408428 +0000
+@@ -114,7 +114,10 @@
+                                         const SurfaceFlagBits& create_initial_flags = {});
+ 
+     /// Get a surface based on the texture configuration
+-    Surface& GetTextureSurface(const Pica::TexturingRegs::FullTextureConfig& config);
++    /// shadow_source: the texture is the lighting shadow map, so it must be created with storage
++    /// usage (matters with AZAHAR_VK_NO_STORAGE); only applied to RGBA8 textures.
++    Surface& GetTextureSurface(const Pica::TexturingRegs::FullTextureConfig& config,
++                               bool shadow_source = false);
+     SurfaceId GetTextureSurface(const Pica::Texture::TextureInfo& info, u32 max_level = 0);
+ 
+     /// Get a texture cube based on the texture configuration
+diff -ruN a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
+--- a/src/video_core/renderer_vulkan/vk_instance.h	2026-10-25 19:16:31.720104190 +0000
++++ b/src/video_core/renderer_vulkan/vk_instance.h	2026-10-25 19:17:17.086352389 +0000
+@@ -42,6 +42,13 @@
+ /// the render stats log line.
+ inline std::atomic<u32> g_shadow_storage_misses{};
+ 
++/// Time the CPU spent blocked waiting for the GPU (fence/timeline wait) and for the scheduler's
++/// worker thread, plus descriptor pools created mid-play. All feed the render stats log line.
++inline std::atomic<u64> g_gpu_wait_ns{};
++inline std::atomic<u32> g_gpu_waits{};
++inline std::atomic<u64> g_worker_wait_ns{};
++inline std::atomic<u32> g_pool_growths{};
++
+ class Instance {
+ public:
+     struct NoInit {};
+diff -ruN a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp	2026-10-25 19:16:31.720118494 +0000
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp	2026-10-25 19:17:17.088694150 +0000
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <chrono>
+ #include <limits>
+ #include <mutex>
+ #include "video_core/renderer_vulkan/vk_instance.h"
+@@ -48,6 +49,7 @@
+     }
+ 
+     // If none of the above is hit, fallback to a regular wait
++    const auto wait_begin = std::chrono::steady_clock::now();
+     const vk::SemaphoreWaitInfoKHR wait_info = {
+         .semaphoreCount = 1,
+         .pSemaphores = &semaphore.get(),
+@@ -58,6 +60,10 @@
+            vk::Result::eSuccess) {
+     }
+     Refresh();
++    g_gpu_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
++                         std::chrono::steady_clock::now() - wait_begin)
++                         .count();
++    ++g_gpu_waits;
+ }
+ 
+ void MasterSemaphoreTimeline::SubmitWork(vk::CommandBuffer cmdbuf, vk::Semaphore wait,
+@@ -121,7 +127,15 @@
+ 
+ void MasterSemaphoreFence::Wait(u64 tick) {
+     std::unique_lock lk{free_mutex};
++    if (gpu_tick.load(std::memory_order_relaxed) >= tick) {
++        return;
++    }
++    const auto wait_begin = std::chrono::steady_clock::now();
+     free_cv.wait(lk, [&] { return gpu_tick.load(std::memory_order_relaxed) >= tick; });
++    g_gpu_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
++                         std::chrono::steady_clock::now() - wait_begin)
++                         .count();
++    ++g_gpu_waits;
+ }
+ 
+ void MasterSemaphoreFence::SubmitWork(vk::CommandBuffer cmdbuf, vk::Semaphore wait,
+diff -ruN a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp	2026-10-25 19:16:31.720166597 +0000
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp	2026-10-25 19:17:17.093026704 +0000
+@@ -88,9 +88,10 @@
+       pipeline_workers{num_worker_threads, "Pipeline workers"},
+       shader_workers{num_worker_threads, "Shader workers"},
+       descriptor_heaps{
+-          DescriptorHeap{instance, scheduler.GetMasterSemaphore(), BUFFER_BINDINGS, 32},
+-          DescriptorHeap{instance, scheduler.GetMasterSemaphore(), TEXTURE_BINDINGS<1>},
+-          DescriptorHeap{instance, scheduler.GetMasterSemaphore(), UTILITY_BINDINGS, 32}},
++          DescriptorHeap{instance, scheduler.GetMasterSemaphore(), BUFFER_BINDINGS, 32, 1024},
++          DescriptorHeap{instance, scheduler.GetMasterSemaphore(), TEXTURE_BINDINGS<1>, 1024,
++                         1024},
++          DescriptorHeap{instance, scheduler.GetMasterSemaphore(), UTILITY_BINDINGS, 32, 1024}},
+       trivial_vertex_shader{
+           instance, vk::ShaderStageFlagBits::eVertex,
+           GLSL::GenerateTrivialVertexShader(instance.IsShaderClipDistanceSupported(), true)} {
+diff -ruN a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp	2026-10-25 19:16:31.720257662 +0000
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp	2026-10-25 19:17:24.119933509 +0000
+@@ -569,9 +569,9 @@
+     }
+ 
+     if (shadow_rendering && !framebuffer->ImageView(SurfaceType::Color)) {
+-        // AZAHAR_VK_NO_STORAGE: this target was created without storage usage, so it cannot take
+-        // shadow writes. Skipping the draw loses those shadows; turn the option off if the game
+-        // uses them.
++        // AZAHAR_VK_NO_STORAGE: this target was created without storage usage (it existed before
++        // shadow rendering used it), so it cannot take shadow writes. Skipping the draw loses
++        // those shadows; turn the option off if the game uses them.
+         static bool warned = false;
+         ++g_shadow_storage_misses;
+         if (!warned) {
+@@ -746,7 +746,7 @@
+     } else if (shadow_reading) {
+         const u32 shadow_texture_unit = regs.lighting.config0.shadow_selector.Value();
+         const auto shadow_texture = regs.texturing.GetTextures()[shadow_texture_unit];
+-        Surface& shadow_surface = res_cache.GetTextureSurface(shadow_texture);
++        Surface& shadow_surface = res_cache.GetTextureSurface(shadow_texture, true);
+         const vk::ImageView shadow_view = shadow_surface.StorageView();
+         if (!shadow_view) {
+             static bool warned = false;
+diff -ruN a/src/video_core/renderer_vulkan/vk_render_manager.cpp b/src/video_core/renderer_vulkan/vk_render_manager.cpp
+--- a/src/video_core/renderer_vulkan/vk_render_manager.cpp	2026-10-25 19:16:31.720326693 +0000
++++ b/src/video_core/renderer_vulkan/vk_render_manager.cpp	2026-10-25 19:17:17.090707270 +0000
+@@ -33,6 +33,9 @@
+     u64 draws{};
+     u64 passes{};
+     u64 flushes{};
++    u64 last_gpu_wait_ns{};
++    u32 last_gpu_waits{};
++    u64 last_worker_wait_ns{};
+     std::chrono::steady_clock::time_point since{std::chrono::steady_clock::now()};
+ 
+     void Report() {
+@@ -41,12 +44,25 @@
+         if (secs < 5.0) {
+             return;
+         }
++        // Time blocked this interval, as a share of wall time: a high GPU wait means the CPU is
++        // idle waiting on the GPU (GPU-bound); near 0 with low fps means the CPU side is the limit.
++        const u64 gpu_ns = g_gpu_wait_ns.load();
++        const u32 gpu_waits = g_gpu_waits.load();
++        const u64 worker_ns = g_worker_wait_ns.load();
++        const double gpu_pct = (gpu_ns - last_gpu_wait_ns) / (secs * 1e7);
++        const double worker_pct = (worker_ns - last_worker_wait_ns) / (secs * 1e7);
++        const double waits_per_s = (gpu_waits - last_gpu_waits) / secs;
++        last_gpu_wait_ns = gpu_ns;
++        last_gpu_waits = gpu_waits;
++        last_worker_wait_ns = worker_ns;
+         if (passes > 0) {
+             LOG_INFO(Render_Vulkan,
+                      "render stats: {:.0f} passes/s, {:.0f} draws/s ({:.1f} per pass), {:.1f} "
+-                     "flushes/s, shadow-storage misses so far: {}",
++                     "flushes/s, GPU wait {:.1f}% ({:.0f} waits/s), render-worker wait {:.1f}%, "
++                     "shadow-storage misses so far: {}, descriptor pools added so far: {}",
+                      passes / secs, draws / secs, static_cast<double>(draws) / passes,
+-                     flushes / secs, g_shadow_storage_misses.load());
++                     flushes / secs, gpu_pct, waits_per_s, worker_pct,
++                     g_shadow_storage_misses.load(), g_pool_growths.load());
+         }
+         draws = passes = flushes = 0;
+         since = now;
+diff -ruN a/src/video_core/renderer_vulkan/vk_resource_pool.cpp b/src/video_core/renderer_vulkan/vk_resource_pool.cpp
+--- a/src/video_core/renderer_vulkan/vk_resource_pool.cpp	2026-10-25 19:16:31.720355990 +0000
++++ b/src/video_core/renderer_vulkan/vk_resource_pool.cpp	2026-10-25 19:17:17.092466179 +0000
+@@ -6,6 +6,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <algorithm>
+ #include <cstddef>
+ #include <optional>
+ #include <unordered_map>
+@@ -109,12 +110,16 @@
+ 
+ constexpr u32 DESCRIPTOR_SET_BATCH = 64;
+ constexpr u32 DESCRIPTOR_MULTIPLIER = 4; // Increase capacity of each pool
++// Small heaps (32 * 4 = 128 sets) ran out within a few batches in busy scenes and created a pool
++// per 128 sets mid-frame. No pool is made smaller than this.
++constexpr u32 MIN_SETS_PER_POOL = 1024;
+ 
+ DescriptorHeap::DescriptorHeap(const Instance& instance, MasterSemaphore* master_semaphore,
+                                std::span<const vk::DescriptorSetLayoutBinding> bindings,
+-                               u32 descriptor_heap_count_)
++                               u32 descriptor_heap_count_, u32 prewarm_sets)
+     : ResourcePool{master_semaphore, DESCRIPTOR_SET_BATCH}, device{instance.GetDevice()},
+-      descriptor_heap_count{descriptor_heap_count_ * DESCRIPTOR_MULTIPLIER} { // Increase pool size
++      descriptor_heap_count{std::max(descriptor_heap_count_ * DESCRIPTOR_MULTIPLIER,
++                                     MIN_SETS_PER_POOL)} { // Increase pool size
+     // Create descriptor set layout.
+     const vk::DescriptorSetLayoutCreateInfo layout_ci = {
+         .bindingCount = static_cast<u32>(bindings.size()),
+@@ -138,6 +143,15 @@
+ 
+     // Create descriptor pool
+     AppendDescriptorPool();
++
++    // Allocate the first sets now instead of in the middle of a frame. Never more than one
++    // pool holds, so this cannot create further pools.
++    const u32 prewarm = std::min(prewarm_sets, descriptor_heap_count);
++    for (u32 done = 0; done + DESCRIPTOR_SET_BATCH <= prewarm; done += DESCRIPTOR_SET_BATCH) {
++        const std::size_t begin = ticks.size();
++        ticks.resize(begin + DESCRIPTOR_SET_BATCH);
++        Allocate(begin, begin + DESCRIPTOR_SET_BATCH);
++    }
+ }
+ 
+ DescriptorHeap::~DescriptorHeap() = default;
+@@ -171,6 +185,7 @@
+             current_pool++;
+             if (current_pool == pools.size()) {
+                 LOG_INFO(Render_Vulkan, "Run out of pools, creating new one!");
++                ++g_pool_growths;
+                 AppendDescriptorPool();
+             }
+             alloc_info.descriptorPool = *pools[current_pool];
+diff -ruN a/src/video_core/renderer_vulkan/vk_resource_pool.h b/src/video_core/renderer_vulkan/vk_resource_pool.h
+--- a/src/video_core/renderer_vulkan/vk_resource_pool.h	2026-10-25 19:16:31.720368659 +0000
++++ b/src/video_core/renderer_vulkan/vk_resource_pool.h	2026-10-25 19:17:17.091018040 +0000
+@@ -65,7 +65,7 @@
+ public:
+     explicit DescriptorHeap(const Instance& instance, MasterSemaphore* master_semaphore,
+                             std::span<const vk::DescriptorSetLayoutBinding> bindings,
+-                            u32 descriptor_heap_count = 1024);
++                            u32 descriptor_heap_count = 1024, u32 prewarm_sets = 0);
+     ~DescriptorHeap() override;
+ 
+     const vk::DescriptorSetLayout& Layout() const {
+diff -ruN a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp	2026-10-25 19:16:31.720381793 +0000
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp	2026-10-25 19:17:17.089982124 +0000
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <chrono>
+ #include <mutex>
+ #include <utility>
+ #include "common/microprofile.h"
+@@ -78,6 +79,7 @@
+     }
+ 
+     MICROPROFILE_SCOPE(Vulkan_WaitForWorker);
++    const auto wait_begin = std::chrono::steady_clock::now();
+     DispatchWork();
+ 
+     // Ensure the queue is drained.
+@@ -89,6 +91,10 @@
+     // Now wait for execution to finish.
+     // This needs to be done in the same order as WorkerThread.
+     std::scoped_lock el{execution_mutex};
++
++    g_worker_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
++                            std::chrono::steady_clock::now() - wait_begin)
++                            .count();
+ }
+ 
+ void Scheduler::Wait(u64 tick) {

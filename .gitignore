@@ -1,0 +1,10 @@
+build/
+baserom/
+*.3ds
+*.cia
+*.cxi
+*.so
+*.jks
+*.bak
+/azahar/
+/reference/

@@ -1,0 +1,140 @@
+name: library-aot
+
+# Builds a game's code library (arm64 .so, 3dsrecomp, any title) from YOUR OWN decrypted game
+# dump (.3ds / .cia / .cxi) kept as an asset of a release in this PRIVATE repository, named
+# game.3ds (or .cia/.cxi), plus optionally its decrypted update, named update.cia.
+# Manual runs only. The output is derived from the game: it stays a short-lived private
+# Actions artifact and is never committed or attached to a release.
+# Copy the .so to the phone: <Azahar user folder>/aot/<TITLEID>.so  (the app stages it into its
+# private storage itself, as it does for the MH4U library).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release (not draft) that holds the game dump"
+        default: "game-data"
+      with_update:
+        description: "Also fetch update.cia (the game's update) and recompile the game WITH it, like Zakuro's Recompile button"
+        type: boolean
+        default: true
+      overrides:
+        description: "Optional folder in this repo with 3dsrecomp override .c files (recomp/docs/overrides.md)"
+        default: ""
+      inline_svc:
+        description: "Fewer unwinds: build with RECOMP_INLINE_SVC (ABI 5, GetSystemTick answered in place). Needs the app from this repo version or newer"
+        type: boolean
+        default: true
+      clear_ccache:
+        description: "Ignore the compile cache (a full rebuild; slow)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  lib:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: Rust (version pinned by recomp/rust-toolchain.toml)
+        run: |
+          rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' recomp/rust-toolchain.toml)" --profile minimal
+          cargo --version
+
+      - name: NDK 27
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKM=$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          yes | "$SDKM" --sdk_root="$SDK" --licenses >/dev/null || true
+          "$SDKM" --sdk_root="$SDK" "ndk;27.3.13750724"
+
+      - name: Build 3dsrecomp and the update-aware wrapper
+        run: |
+          (cd recomp && cargo build --release --locked)
+          (cd tools/recomp-update && cargo build --release)
+
+      - name: Fetch your dump from the private release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          gh release download "${{ inputs.release_tag }}" --pattern 'game.*' --pattern 'update.*' --dir data
+          ls -l data
+
+      - name: Join split files (GitHub assets are limited to 2 GiB, so big dumps are uploaded in parts)
+        run: |
+          for base in game.3ds game.cia game.cxi update.cia; do
+            if ls data/$base.part-* >/dev/null 2>&1; then
+              cat data/$base.part-* > data/$base
+              rm data/$base.part-*
+            fi
+          done
+          ls -l data
+
+      - name: Mark plain dumps as decrypted (leftover encryption flags)
+        run: python3 -I tools/fix_dump_flags.py data/game.* data/update.*
+
+      - name: Analyse (how much code was found)
+        run: recomp/target/release/3dsrecomp analyze "$(ls data/game.* | head -n1)"
+
+      # Hints: the <TITLEID>.hints file the app wrote (<Azahar user folder>/aot/) after you played,
+      # committed as hints/<TITLEID>.hints. 3dsrecomp's build reads it from its library folder and
+      # recompiles those addresses as functions ("hints N new functions" in the log below). The
+      # file holds code addresses only, no game data.
+      - name: Install hints from the repository
+        run: |
+          dest="${XDG_DATA_HOME:-$HOME/.local/share}/3dsrecomp"
+          mkdir -p "$dest"
+          if ls hints/*.hints >/dev/null 2>&1; then
+            cp -v hints/*.hints "$dest/"
+            wc -l hints/*.hints
+          else
+            echo "no hints/*.hints in the repository: building without"
+          fi
+
+      # The compile of the generated C is most of the time. ccache keeps each compiled file, so a
+      # rebuild that changes a few functions (an override, say) recompiles only the files those
+      # are in, if the generated C of the rest comes out the same. "ccache -s" at the end shows
+      # the hits. The cache holds compiled game code: this workflow only runs in a private repo.
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: library-aot
+          max-size: 3G
+
+      - name: Recompile and compile with the NDK (long)
+        run: |
+          NDK="$ANDROID_SDK_ROOT/ndk/27.3.13750724"
+          export CC="ccache $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
+          ccache --zero-stats
+          if [ "${{ inputs.clear_ccache }}" = "true" ]; then export CCACHE_DISABLE=1; fi
+          if [ "${{ inputs.inline_svc }}" = "true" ]; then export RECOMP_INLINE_SVC=1; fi
+          args=()
+          if [ -n "${{ inputs.overrides }}" ]; then args+=(--overrides "${{ inputs.overrides }}"); fi
+          mkdir -p out
+          GAME="$(ls data/game.* | head -n1)"
+          UPDATE="$(ls data/update.* 2>/dev/null | head -n1 || true)"
+          if [ "${{ inputs.with_update }}" = "true" ] && [ -n "$UPDATE" ]; then
+            echo "recompiling $GAME with its update $UPDATE"
+            tools/recomp-update/target/release/recomp-update "$GAME" "$UPDATE" out "${args[@]}"
+          else
+            recomp/target/release/3dsrecomp build "$GAME" out "${args[@]}"
+          fi
+          ls -l out/*.so
+          ccache --show-stats
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aot-code-library
+          path: out/*.so
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Remove game data from the runner
+        if: always()
+        run: rm -rf data out

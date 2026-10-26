@@ -1,0 +1,223 @@
+diff -ruN a/src/video_core/rasterizer_cache/rasterizer_cache.h b/src/video_core/rasterizer_cache/rasterizer_cache.h
+--- a/src/video_core/rasterizer_cache/rasterizer_cache.h	2026-10-25 19:53:13.474194721 +0000
++++ b/src/video_core/rasterizer_cache/rasterizer_cache.h	2026-10-25 19:53:37.886353533 +0000
+@@ -146,6 +146,30 @@
+ }
+ 
+ template <class T>
++void RasterizerCache<T>::UpgradeToStorage(SurfaceId surface_id) {
++    // Same in-place swap as a custom texture upload: the id stays, so the page table and dirty
++    // regions still point at it, and the old image waits in `sentenced` until the GPU is done.
++    const SurfaceFlagBits old_flags = slot_surfaces[surface_id].flags;
++    // The newest copy may only be on the GPU: write it back so the new image can load it
++    FlushRegion(slot_surfaces[surface_id].addr, slot_surfaces[surface_id].size, surface_id);
++
++    // (copied: the old object is moved out of its slot before the new one is built)
++    const SurfaceParams params = slot_surfaces[surface_id];
++    const SurfaceId old_id =
++        slot_surfaces.swap_and_insert(surface_id, runtime, params, SurfaceFlagBits::ShadowSource);
++    slot_surfaces[old_id].flags &= ~SurfaceFlagBits::Registered;
++    sentenced.emplace_back(old_id, runtime.GetResourceTick());
++    RemoveFramebuffers(surface_id);
++
++    Surface& surface = slot_surfaces[surface_id];
++    surface.flags = (old_flags | SurfaceFlagBits::ShadowSource) & ~SurfaceFlagBits::NoStorage;
++    surface.MarkInvalid(surface.GetInterval());
++    ValidateSurface(surface_id, surface.addr, surface.size);
++    LOG_INFO(HW_GPU, "shadow surface {:#x} ({}x{}) replaced by one with storage usage",
++             params.addr, params.width, params.height);
++}
++
++template <class T>
+ void RasterizerCache<T>::RemoveFramebuffers(SurfaceId surface_id) {
+     for (auto it = framebuffers.begin(); it != framebuffers.end();) {
+         const auto& params = it->first;
+@@ -625,6 +649,10 @@
+     }
+ 
+     SurfaceId surface_id = GetSurface(params, ScaleMatch::Ignore, true, initial_flags);
++    if (surface_id && info.is_shadow_source &&
++        True(slot_surfaces[surface_id].flags & SurfaceFlagBits::NoStorage)) {
++        UpgradeToStorage(surface_id);
++    }
+     return surface_id ? surface_id : NULL_SURFACE_ID;
+ }
+ 
+@@ -749,14 +777,20 @@
+     SurfaceId color_id{};
+     u32 color_level{};
+     if (using_color_fb) {
+-        // Shadow rendering writes through an R32 storage view, so an RGBA8 target created for it
++        // Shadow rendering writes through an R32 storage view, so an RGBA8 target made for it
+         // must have storage usage (matters with AZAHAR_VK_NO_STORAGE, harmless otherwise).
+         SurfaceFlagBits color_flags{};
+-        if (regs.framebuffer.IsShadowRendering() && color_params.pixel_format == PixelFormat::RGBA8) {
++        const bool shadow_target = regs.framebuffer.IsShadowRendering() &&
++                                   color_params.pixel_format == PixelFormat::RGBA8;
++        if (shadow_target) {
+             color_flags |= SurfaceFlagBits::ShadowSource;
+         }
+         std::tie(color_id, color_rect) =
+             GetSurfaceSubRect(color_params, ScaleMatch::Exact, false, color_flags);
++        // An older surface at this address made without storage: swap it (same id, same rect)
++        if (shadow_target && color_id && True(slot_surfaces[color_id].flags & SurfaceFlagBits::NoStorage)) {
++            UpgradeToStorage(color_id);
++        }
+     }
+ 
+     Common::Rectangle<u32> depth_rect{};
+@@ -1389,6 +1423,9 @@
+                    // Only recycle the texture if its resolution scale is equal or less than the
+                    // incoming texture
+                    (slot_surfaces[pair.first].res_scale <= params.res_scale) &&
++                   // A shadow surface needs storage usage, which a NoStorage one does not have
++                   (False(initial_flags & SurfaceFlagBits::ShadowSource) ||
++                    False(slot_surfaces[pair.first].flags & SurfaceFlagBits::NoStorage)) &&
+                    // Only recycle the texture if the texture runtime is completely done with it
+                    (resource_free_tick > pair.second);
+         });
+diff -ruN a/src/video_core/rasterizer_cache/rasterizer_cache_base.h b/src/video_core/rasterizer_cache/rasterizer_cache_base.h
+--- a/src/video_core/rasterizer_cache/rasterizer_cache_base.h	2026-10-25 19:53:13.474225785 +0000
++++ b/src/video_core/rasterizer_cache/rasterizer_cache_base.h	2026-10-25 19:53:37.885293060 +0000
+@@ -173,6 +173,9 @@
+     /// Removes any framebuffers that reference the provided surface_id.
+     void RemoveFramebuffers(SurfaceId surface_id);
+ 
++    /// Replaces a surface made without storage usage (NoStorage) by one with it, keeping its id.
++    void UpgradeToStorage(SurfaceId surface_id);
++
+     /// Removes any references of the provided surface id from cached texture cubes.
+     void RemoveTextureCubeFace(SurfaceId surface_id);
+ 
+diff -ruN a/src/video_core/rasterizer_cache/surface_base.h b/src/video_core/rasterizer_cache/surface_base.h
+--- a/src/video_core/rasterizer_cache/surface_base.h	2026-10-25 19:53:13.474355369 +0000
++++ b/src/video_core/rasterizer_cache/surface_base.h	2026-10-25 19:53:37.884198720 +0000
+@@ -21,6 +21,8 @@
+     Custom = 1 << 3,       ///< Surface texture has been replaced with a custom texture.
+     ShadowSource = 1 << 4, ///< Surface is used as a shadow source.
+     RenderTarget = 1 << 5, ///< Surface was a render target.
++    NoStorage = 1 << 6,    ///< RGBA8 surface made without storage usage (Vulkan, option 2); it is
++                           ///< replaced by one with storage if a shadow needs it.
+ };
+ DECLARE_ENUM_FLAG_OPERATORS(SurfaceFlagBits);
+ 
+diff -ruN a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp	2026-10-25 19:53:13.480377170 +0000
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp	2026-10-25 19:53:37.884811029 +0000
+@@ -165,16 +165,16 @@
+     CreateCustomFormatTable();
+     CreateAttribTable();
+ 
+-    const char* no_storage = std::getenv("AZAHAR_VK_NO_STORAGE");
+-    const bool no_storage_requested = no_storage && no_storage[0] == '1';
++    const int storage_mode = RequestedStorageMode();
+     LOG_INFO(Render_Vulkan,
+              "GPU \"{}\", driver {} {}; null descriptors: {}; RGBA8 storage opt-out: {}; "
+              "pass flush on this driver: {}",
+              properties.deviceName.data(), vk::to_string(driver_id), GetDriverVersionName(),
+              null_descriptor ? "yes" : "no",
+-             !no_storage_requested ? "off"
+-             : null_descriptor     ? "ACTIVE"
+-                                   : "requested but ignored (driver lacks nullDescriptor)",
++             storage_mode == 0 ? "off"
++             : !null_descriptor ? "requested but ignored (driver lacks nullDescriptor)"
++             : storage_mode == 1 ? "ACTIVE, no shadows"
++                                 : "ACTIVE, shadows kept",
+              ShouldFlush() ? "yes" : "no");
+ }
+ 
+diff -ruN a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
+--- a/src/video_core/renderer_vulkan/vk_instance.h	2026-10-25 19:53:13.480500204 +0000
++++ b/src/video_core/renderer_vulkan/vk_instance.h	2026-10-25 19:53:37.884406871 +0000
+@@ -169,16 +169,30 @@
+         return null_descriptor;
+     }
+ 
+-    /// MH4U port: when AZAHAR_VK_NO_STORAGE=1, RGBA8 surfaces are created without storage usage
+-    /// and the mutable-format flag, which (on tile-based mobile GPUs) lets the driver keep
+-    /// framebuffer compression on. Only surfaces flagged as shadow sources keep storage. Needs
+-    /// null descriptors: a storage-less surface bound for shadows becomes a null view instead.
+-    bool DropRgba8Storage() const {
+-        static const bool requested = [] {
++    /// MH4U port: AZAHAR_VK_NO_STORAGE picks how RGBA8 surfaces are made. 0 (or unset): Azahar's
++    /// own, with storage usage. 1: without storage usage and the mutable-format flag, which (on
++    /// tile-based mobile GPUs) lets the driver keep framebuffer compression on; no shadows at
++    /// all. 2: the same, but a surface a shadow needs is replaced by one with storage.
++    static int RequestedStorageMode() {
++        static const int mode = [] {
+             const char* v = std::getenv("AZAHAR_VK_NO_STORAGE");
+-            return v && v[0] == '1';
++            return (v && v[0] == '1') ? 1 : (v && v[0] == '2') ? 2 : 0;
+         }();
+-        return requested && null_descriptor;
++        return mode;
++    }
++
++    /// Needs null descriptors: a storage-less surface bound for shadows becomes a null view.
++    int RgbaStorageMode() const {
++        return null_descriptor ? RequestedStorageMode() : 0;
++    }
++
++    bool DropRgba8Storage() const {
++        return RgbaStorageMode() != 0;
++    }
++
++    /// Mode 2: surfaces known (or found out) to be shadow surfaces keep or get storage usage.
++    bool KeepShadowStorage() const {
++        return RgbaStorageMode() == 2;
+     }
+ 
+     /// Returns true when VK_EXT_fragment_shader_interlock is supported
+diff -ruN a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp	2026-10-25 19:53:13.481346481 +0000
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp	2026-10-25 19:53:37.887017089 +0000
+@@ -569,16 +569,17 @@
+     }
+ 
+     if (shadow_rendering && !framebuffer->ImageView(SurfaceType::Color)) {
+-        // AZAHAR_VK_NO_STORAGE: this target was created without storage usage (it existed before
+-        // shadow rendering used it), so it cannot take shadow writes. Skipping the draw loses
+-        // those shadows; turn the option off if the game uses them.
++        // AZAHAR_VK_NO_STORAGE=1 (shadows off): this target has no storage usage, so it cannot
++        // take shadow writes and the draw is skipped. Mode 2 swaps such a surface for one with
++        // storage before it gets here.
+         static bool warned = false;
+         ++g_shadow_storage_misses;
+         if (!warned) {
+             warned = true;
+             LOG_WARNING(Render_Vulkan,
+                         "Shadow rendering into a surface without storage usage skipped "
+-                        "(AZAHAR_VK_NO_STORAGE); turn that option off if shadows are missing");
++                        "(Lighter surfaces: shadows are off in that mode; pick \"with shadows\" or "
++                        "Off for them)");
+         }
+         return true;
+     }
+@@ -755,7 +756,8 @@
+                 warned = true;
+                 LOG_WARNING(Render_Vulkan,
+                             "Shadow texture without storage usage read as empty "
+-                            "(AZAHAR_VK_NO_STORAGE); turn that option off if shadows are wrong");
++                            "(Lighter surfaces: shadows are off in that mode; pick \"with shadows\" "
++                            "or Off for them)");
+             }
+         }
+         update_queue.AddStorageImage(utility_set, 0, shadow_view);
+diff -ruN a/src/video_core/renderer_vulkan/vk_texture_runtime.cpp b/src/video_core/renderer_vulkan/vk_texture_runtime.cpp
+--- a/src/video_core/renderer_vulkan/vk_texture_runtime.cpp	2026-10-25 19:53:13.482570281 +0000
++++ b/src/video_core/renderer_vulkan/vk_texture_runtime.cpp	2026-10-25 19:53:37.885091046 +0000
+@@ -773,7 +773,13 @@
+     // be worked out before the local `flags` below hides the surface's own).
+     has_storage = traits.native == vk::Format::eR8G8B8A8Unorm && traits.storage_support &&
+                   (!instance.DropRgba8Storage() ||
+-                   True(flags & VideoCore::SurfaceFlagBits::ShadowSource));
++                   (instance.KeepShadowStorage() &&
++                    True(flags & VideoCore::SurfaceFlagBits::ShadowSource)));
++    if (instance.KeepShadowStorage() && instance.DropRgba8Storage() && !has_storage &&
++        traits.native == vk::Format::eR8G8B8A8Unorm && traits.storage_support) {
++        // Lets the rasterizer cache swap this surface for one with storage if a shadow needs it.
++        flags |= VideoCore::SurfaceFlagBits::NoStorage;
++    }
+ 
+     if (instance.DropRgba8Storage() && !has_storage) {
+         // the mutable format is only there for the R32 storage view

@@ -1,0 +1,152 @@
+diff -ruN a/src/audio_core/cubeb_sink.cpp b/src/audio_core/cubeb_sink.cpp
+--- a/src/audio_core/cubeb_sink.cpp	2026-10-26 00:30:01.475532267 +0000
++++ b/src/audio_core/cubeb_sink.cpp	2026-10-26 00:30:09.281522833 +0000
+@@ -3,6 +3,7 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <cstdarg>
++#include <cstdlib>
+ #include <cstring>
+ #include <mutex>
+ #include <vector>
+@@ -13,6 +14,26 @@
+ 
+ namespace AudioCore {
+ 
++namespace {
++/// Creates the cubeb context. AZAHAR_CUBEB_BACKEND (the MH4U port's Android audio driver
++/// setting: "aaudio" or "opensl") picks the backend; unset or unavailable: cubeb's own choice.
++int InitCubeb(cubeb** ctx, const char* name) {
++    const char* wanted = std::getenv("AZAHAR_CUBEB_BACKEND");
++    if (wanted && wanted[0]) {
++        if (cubeb_init(ctx, name, wanted) == CUBEB_OK) {
++            LOG_INFO(Audio_Sink, "Audio driver: {} (requested)", cubeb_get_backend_id(*ctx));
++            return CUBEB_OK;
++        }
++        LOG_WARNING(Audio_Sink, "Audio driver {} is not available, using the default", wanted);
++    }
++    const int result = cubeb_init(ctx, name, nullptr);
++    if (result == CUBEB_OK) {
++        LOG_INFO(Audio_Sink, "Audio driver: {} (default)", cubeb_get_backend_id(*ctx));
++    }
++    return result;
++}
++} // namespace
++
+ struct CubebSink::Impl {
+     cubeb* ctx = nullptr;
+     cubeb_stream* stream = nullptr;
+@@ -26,7 +47,7 @@
+ };
+ 
+ CubebSink::CubebSink(std::string_view target_device_name) : impl(std::make_unique<Impl>()) {
+-    if (cubeb_init(&impl->ctx, "Azahar Output", nullptr) != CUBEB_OK) {
++    if (InitCubeb(&impl->ctx, "Azahar Output") != CUBEB_OK) {
+         LOG_CRITICAL(Audio_Sink, "cubeb_init failed");
+         return;
+     }
+@@ -165,7 +186,7 @@
+     std::vector<std::string> device_list;
+     cubeb* ctx;
+ 
+-    if (cubeb_init(&ctx, "Azahar Output Device Enumerator", nullptr) != CUBEB_OK) {
++    if (InitCubeb(&ctx, "Azahar Output Device Enumerator") != CUBEB_OK) {
+         LOG_CRITICAL(Audio_Sink, "cubeb_init failed");
+         return {};
+     }
+diff -ruN a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp	2026-10-26 00:30:01.735093848 +0000
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp	2026-10-26 00:30:09.280101958 +0000
+@@ -165,7 +165,7 @@
+     CreateCustomFormatTable();
+     CreateAttribTable();
+ 
+-    const int storage_mode = RequestedStorageMode();
++    const int storage_mode = requested_storage_mode;
+     LOG_INFO(Render_Vulkan,
+              "GPU \"{}\", driver {} {}; null descriptors: {}; RGBA8 storage opt-out: {}; "
+              "pass flush on this driver: {}",
+diff -ruN a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
+--- a/src/video_core/renderer_vulkan/vk_instance.h	2026-10-26 00:30:01.735118630 +0000
++++ b/src/video_core/renderer_vulkan/vk_instance.h	2026-10-26 00:30:09.279628054 +0000
+@@ -173,17 +173,15 @@
+     /// own, with storage usage. 1: without storage usage and the mutable-format flag, which (on
+     /// tile-based mobile GPUs) lets the driver keep framebuffer compression on; no shadows at
+     /// all. 2: the same, but a surface a shadow needs is replaced by one with storage.
+-    static int RequestedStorageMode() {
+-        static const int mode = [] {
+-            const char* v = std::getenv("AZAHAR_VK_NO_STORAGE");
+-            return (v && v[0] == '1') ? 1 : (v && v[0] == '2') ? 2 : 0;
+-        }();
+-        return mode;
++    /// Read when the instance is created, so a changed setting applies at the next game start.
++    static int ReadRequestedStorageMode() {
++        const char* v = std::getenv("AZAHAR_VK_NO_STORAGE");
++        return (v && v[0] == '1') ? 1 : (v && v[0] == '2') ? 2 : 0;
+     }
+ 
+     /// Needs null descriptors: a storage-less surface bound for shadows becomes a null view.
+     int RgbaStorageMode() const {
+-        return null_descriptor ? RequestedStorageMode() : 0;
++        return null_descriptor ? requested_storage_mode : 0;
+     }
+ 
+     bool DropRgba8Storage() const {
+@@ -373,6 +371,7 @@
+     bool custom_border_color{};
+     bool index_type_uint8{};
+     bool null_descriptor{};
++    int requested_storage_mode = ReadRequestedStorageMode();
+     bool fragment_shader_interlock{};
+     bool image_format_list{};
+     bool pipeline_creation_cache_control{};
+diff -ruN a/src/video_core/renderer_vulkan/vk_render_manager.cpp b/src/video_core/renderer_vulkan/vk_render_manager.cpp
+--- a/src/video_core/renderer_vulkan/vk_render_manager.cpp	2026-10-26 00:30:01.735482997 +0000
++++ b/src/video_core/renderer_vulkan/vk_render_manager.cpp	2026-10-26 00:30:01.793198796 +0000
+@@ -15,13 +15,14 @@
+ namespace Vulkan {
+ 
+ // Draws in a render pass before its end is flushed on Mali/Qualcomm drivers. AZAHAR_VK_FLUSH_DRAWS
+-// overrides the default (20), to compare values on a device without rebuilding.
+-static const u32 MinDrawsToFlush = [] {
++// overrides the default (20), to compare values on a device without rebuilding. Read when the
++// renderer is created (each game start), not once per process.
++static u32 ReadMinDrawsToFlush() {
+     if (const char* v = std::getenv("AZAHAR_VK_FLUSH_DRAWS")) {
+         return static_cast<u32>(std::strtoul(v, nullptr, 10));
+     }
+     return 20u;
+-}();
++}
+ 
+ using VideoCore::PixelFormat;
+ using VideoCore::SurfaceType;
+@@ -72,7 +73,7 @@
+ } // namespace
+ 
+ RenderManager::RenderManager(const Instance& instance, Scheduler& scheduler)
+-    : instance{instance}, scheduler{scheduler} {}
++    : instance{instance}, scheduler{scheduler}, min_draws_to_flush{ReadMinDrawsToFlush()} {}
+ 
+ RenderManager::~RenderManager() = default;
+ 
+@@ -190,7 +191,7 @@
+ 
+     // The Mali guide recommends flushing at the end of each major renderpass
+     // Testing has shown this has a significant effect on rendering performance
+-    if (num_draws > MinDrawsToFlush && instance.ShouldFlush()) {
++    if (num_draws > min_draws_to_flush && instance.ShouldFlush()) {
+         scheduler.Flush();
+         pass_stats.flushes++;
+         num_draws = 0;
+diff -ruN a/src/video_core/renderer_vulkan/vk_render_manager.h b/src/video_core/renderer_vulkan/vk_render_manager.h
+--- a/src/video_core/renderer_vulkan/vk_render_manager.h	2026-10-26 00:30:01.735498981 +0000
++++ b/src/video_core/renderer_vulkan/vk_render_manager.h	2026-10-26 00:30:01.793504428 +0000
+@@ -70,6 +70,7 @@
+     bool shadow_rendering{};
+     RenderPass pass{};
+     u32 num_draws{};
++    u32 min_draws_to_flush{};
+ };
+ 
+ } // namespace Vulkan

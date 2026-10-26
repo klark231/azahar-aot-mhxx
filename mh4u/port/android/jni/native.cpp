@@ -1,0 +1,931 @@
+// The Android app's native side (org.mh4u.port.Native): runs Azahar's core with the game's
+// recompiled code as the CPU, on a Surface from Kotlin. Everything the PC app (port/app) does
+// around the core is the same code here where it doesn't depend on SDL: the app's settings
+// (config.cpp), rooms (multiplayer.cpp, invite.cpp, launcher/lobby.cpp) and the port's hooks
+// and options (src/hooks.cpp). What differs is this file: the window, input, storage, the
+// keyboard and the thread the game runs on.
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <fstream>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <string>
+
+#include <android/api-level.h>
+#include <android/native_window_jni.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <jni.h>
+#include <json.hpp>
+#ifdef MH4U_ADRENOTOOLS
+#include <adrenotools/driver.h>
+#endif
+
+#include "common/android_utils.h"
+#include "common/dynamic_library.h"
+#include "common/file_util.h"
+#include "common/logging/backend.h"
+#include "common/logging/filter.h"
+#include "common/logging/log.h"
+#include "common/scope_exit.h"
+#include "common/settings.h"
+#include "common/thread.h"
+#include "config.h"
+#ifdef MH4U_AOT
+#include "arm_aot.h"
+#endif
+#include "core/cheats/cheats.h"
+#include "core/cheats/gateway_cheat.h"
+#include "core/core.h"
+#include "core/frontend/applets/default_applets.h"
+#include "core/hle/service/am/am.h"
+#include "core/hle/service/cfg/cfg.h"
+#include "core/loader/loader.h"
+#include "emu_window_android.h"
+#include "frontend.h"
+#include "hooks.h"
+#include "input_common/main.h"
+#include "input_map.h"
+#include "invite.h"
+#include "jni_env.h"
+#include "keyboard_android.h"
+#include "launcher/lobby.h"
+#include "multiplayer.h"
+#include "network/network.h"
+#include "pad_device.h"
+#include "video_core/gpu.h"
+#include "video_core/renderer_base.h"
+
+namespace App::Input {
+// config.cpp's Apply() asks for the input profile; here the pad device builds it (pad_device.cpp)
+void BuildProfile(const Config&) {
+    Mh4uAndroid::Pad::Init();
+}
+std::string ControllerDescription() {
+    return "controls: the app's pad (on-screen controls and any device Android lists)";
+}
+} // namespace App::Input
+
+namespace {
+
+using nlohmann::json;
+using Mh4uAndroid::EmuWindow;
+
+// ── state shared between the UI thread and the emulation thread ──
+std::recursive_mutex surface_mutex;
+std::condition_variable_any surface_cv;
+ANativeWindow* g_surface = nullptr;
+int g_surface_width = 0, g_surface_height = 0;  // its size as the activity reported it
+std::unique_ptr<EmuWindow> g_window;
+
+std::atomic<bool> g_stop{true};
+std::atomic<bool> g_pause{false};
+std::mutex g_run_mutex;  // one game at a time
+std::mutex g_pause_mutex;
+std::condition_variable g_pause_cv;
+
+std::mutex g_task_mutex;
+std::queue<std::function<void()>> g_tasks;  // for the emulation thread, once per loop
+
+App::Config g_config;
+std::string g_notice;  // the code library's note for the player (Port::BackendNotice)
+std::mutex g_notice_mutex;
+bool g_initialised = false;
+
+void Post(std::function<void()> task) {
+    std::scoped_lock lock(g_task_mutex);
+    g_tasks.push(std::move(task));
+}
+
+void RunTasks() {
+    std::queue<std::function<void()>> now;
+    {
+        std::scoped_lock lock(g_task_mutex);
+        now.swap(g_tasks);
+    }
+    for (; !now.empty(); now.pop()) {
+        now.front()();
+    }
+}
+
+std::string Str(JNIEnv* env, jstring s) {
+    if (!s) {
+        return {};
+    }
+    const char* chars = env->GetStringUTFChars(s, nullptr);
+    std::string out = chars ? chars : "";
+    if (chars) {
+        env->ReleaseStringUTFChars(s, chars);
+    }
+    return out;
+}
+
+/// A Java string as real UTF-8 (GetStringUTFChars gives "modified" UTF-8, which writes an emoji
+/// as two surrogates: fine for a file name, wrong for what goes to other players).
+std::string Utf8Str(JNIEnv* env, jstring s) {
+    if (!s) {
+        return {};
+    }
+    const jsize n = env->GetStringLength(s);
+    const jchar* c = env->GetStringChars(s, nullptr);
+    std::string out;
+    for (jsize i = 0; c && i < n; ++i) {
+        std::uint32_t cp = c[i];
+        if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < n && c[i + 1] >= 0xDC00 && c[i + 1] < 0xE000) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (c[i + 1] - 0xDC00);
+            ++i;
+        } else if (cp >= 0xD800 && cp < 0xE000) {
+            cp = 0xFFFD;  // a lone surrogate
+        }
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            out += static_cast<char>(0xC0 | cp >> 6);
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += static_cast<char>(0xE0 | cp >> 12);
+            out += static_cast<char>(0x80 | (cp >> 6 & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | cp >> 18);
+            out += static_cast<char>(0x80 | (cp >> 12 & 0x3F));
+            out += static_cast<char>(0x80 | (cp >> 6 & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+    if (c) {
+        env->ReleaseStringChars(s, c);
+    }
+    return out;
+}
+
+jstring JStr(JNIEnv* env, const std::string& s) {
+    return env->NewStringUTF(s.c_str());
+}
+
+/// What Kotlin's screen options ask for that the PC app has no name for: portrait layouts, the
+/// screen gap, the large screen's share, swapped and upright screens. "key=value" lines.
+void ApplyScreenExtras(const std::string& text) {
+    auto& v = Settings::values;
+    std::size_t at = 0;
+    while (at < text.size()) {
+        const std::size_t end = std::min(text.find('\n', at), text.size());
+        const std::string line = text.substr(at, end - at);
+        at = end + 1;
+        const std::size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        const std::string key = line.substr(0, eq);
+        const std::string value = line.substr(eq + 1);
+        if (key == "swap") {
+            v.swap_screen = value == "1";
+        } else if (key == "upright") {
+            v.upright_screen = value == "1";
+        } else if (key == "gap") {
+            v.screen_gap = std::atoi(value.c_str());
+        } else if (key == "large_proportion") {
+            v.large_screen_proportion = static_cast<float>(std::atof(value.c_str()));
+        } else if (key == "portrait") {
+            v.portrait_layout_option =
+                value == "original" ? Settings::PortraitLayoutOption::PortraitOriginal
+                : value == "custom" ? Settings::PortraitLayoutOption::PortraitCustomLayout
+                                    : Settings::PortraitLayoutOption::PortraitTopFullWidth;
+        }
+    }
+}
+
+// ── Adreno GPU boost and custom Vulkan drivers (libadrenotools) ──
+std::string g_hook_lib_dir;   // the app's native library folder, where libadrenotools' hooks are
+std::string g_drivers_dir;    // <files>/gpu_drivers: one folder per driver, each with a meta.json
+std::shared_ptr<Common::DynamicLibrary> g_driver_library;
+std::string g_driver_wanted;  // what the first start in this process asked for
+bool g_driver_tried = false;
+std::string g_driver_marker;  // exists while a custom driver has not proven itself yet
+
+[[maybe_unused]] bool KgslPresent() {
+    return access("/dev/kgsl-3d0", F_OK) == 0;
+}
+
+bool CustomDriverSupported() {
+#ifdef MH4U_ADRENOTOOLS
+    return android_get_device_api_level() >= 28 && KgslPresent();
+#else
+    return false;
+#endif
+}
+
+void ClearDriverMarker() {
+    if (!g_driver_marker.empty()) {
+        unlink(g_driver_marker.c_str());
+        g_driver_marker.clear();
+    }
+}
+
+void SetAdrenoBoost(bool on) {
+#ifdef MH4U_ADRENOTOOLS
+    static bool active = false;
+    if (on == active) {
+        return;
+    }
+    if (on && !KgslPresent()) {
+        LOG_INFO(Frontend, "Adreno GPU boost: no Adreno GPU here, left off");
+        return;
+    }
+    adrenotools_set_turbo(on);
+    active = on;
+    LOG_INFO(Frontend, "Adreno GPU boost {}", on ? "on" : "off");
+#else
+    (void)on;
+#endif
+}
+
+/// The Vulkan library of the driver the player picked, or none for the system's. A custom driver
+/// can only be loaded once per process, so a change takes the next start of the app; a driver
+/// that crashed the last start is left out (until the player picks one again) so the app opens.
+std::shared_ptr<Common::DynamicLibrary> ChooseGpuDriver(const std::string& wanted_setting,
+                                                        std::string& note) {
+    const std::string wanted = wanted_setting == "system" ? std::string{} : wanted_setting;
+#ifdef MH4U_ADRENOTOOLS
+    if (g_driver_tried) {
+        if (wanted != g_driver_wanted) {
+            note = "The GPU driver change takes effect after the app is fully closed and reopened.";
+        }
+        return g_driver_library;
+    }
+    g_driver_tried = true;
+    g_driver_wanted = wanted;
+    if (wanted.empty()) {
+        return {};
+    }
+    if (!CustomDriverSupported() || g_drivers_dir.empty()) {
+        note = "This device cannot load custom GPU drivers (an Adreno GPU is required). The system driver is in use.";
+        return {};
+    }
+    const std::string folder = g_drivers_dir + "/" + wanted + "/";
+    const std::string marker = g_drivers_dir + "/.loading";
+    if (access(marker.c_str(), F_OK) == 0) {
+        note = "The custom GPU driver failed to start last time, so the system driver is in use. "
+               "Select the driver again in Settings to retry.";
+        LOG_WARNING(Frontend, "gpu driver: {} left a start marker, using the system driver", wanted);
+        return {};
+    }
+    std::string library_name;
+    try {
+        std::ifstream meta(folder + "meta.json");
+        library_name = json::parse(meta).value("libraryName", "");
+    } catch (const std::exception& e) {
+        LOG_WARNING(Frontend, "gpu driver {}: meta.json unreadable: {}", wanted, e.what());
+    }
+    if (library_name.empty() || access((folder + library_name).c_str(), R_OK) != 0) {
+        note = "The selected GPU driver is missing or incomplete. The system driver is in use.";
+        return {};
+    }
+    // a start that crashes leaves this behind (cleared when the game has run a while)
+    if (std::ofstream(marker).is_open()) {
+        g_driver_marker = marker;
+    }
+    void* handle = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, nullptr,
+                                              g_hook_lib_dir.c_str(), folder.c_str(),
+                                              library_name.c_str(), nullptr, nullptr);
+    if (!handle) {
+        ClearDriverMarker();
+        note = "The GPU driver \"" + wanted + "\" could not be loaded. The system driver is in use.";
+        LOG_ERROR(Frontend, "gpu driver {}: adrenotools_open_libvulkan failed", wanted);
+        return {};
+    }
+    LOG_INFO(Frontend, "gpu driver: loaded {} ({})", wanted, library_name);
+    g_driver_library = std::make_shared<Common::DynamicLibrary>(handle);
+    return g_driver_library;
+#else
+    if (!wanted.empty()) {
+        note = "This build does not support custom GPU drivers.";
+    }
+    return {};
+#endif
+}
+
+/// The app's settings (mh4u-app.ini) as Azahar's, then what is Android's own. PC's Apply() does
+/// the common part (renderer, filter, clock, sound level, the input profile).
+void ApplyConfig(const App::Config& config) {
+    App::Apply(config);
+#ifdef MH4U_AOT
+    Aot::SetSkipIdle(config.aot_skip_idle);
+    Aot::SetInlineSvc(config.aot_fewer_unwinds);
+#endif
+    auto& v = Settings::values;
+    v.graphics_api = Settings::GraphicsAPI::Vulkan;   // the one renderer of this app
+    v.output_type = AudioCore::SinkType::Cubeb;       // Cubeb's Android backend (AAudio)
+    v.use_vsync = config.vsync;
+    // which cores the game's threads may run on (read when the game starts)
+    v.cpu_affinity_mode.SetValue(config.cpu_affinity == "big"      ? 1
+                                 : config.cpu_affinity == "prime"  ? 2
+                                 : config.cpu_affinity == "little" ? 3
+                                                                   : 0);
+    SetAdrenoBoost(config.adreno_boost);   // live: takes effect in a running game too
+    // this Azahar counts the internal resolution in percent (100: native); the app's ini in
+    // multiples of the 3DS's, 0 meaning from the screen
+    v.resolution_factor = static_cast<u32>(config.resolution * 100);
+    // layouts the PC app doesn't have (Azahar's own names)
+    if (config.screens == "large") {
+        v.layout_option = Settings::LayoutOption::LargeScreen;
+    } else if (config.screens == "hybrid") {
+        v.layout_option = Settings::LayoutOption::HybridScreen;
+    } else if (config.screens == "windows") {
+        v.layout_option = Settings::LayoutOption::CustomLayout;  // no second window on a phone
+    }
+}
+
+// ── the game thread ──
+Core::System::ResultStatus Run(const std::string& game, std::string& message) {
+    std::scoped_lock run_lock(g_run_mutex);
+    auto& system = Core::System::GetInstance();
+
+    // A new run starts "not stopped": g_stop begins true, so without this the wait below
+    // returns at once, before the surface exists, and the run ends silently.
+    g_stop = false;
+
+    // the surface the window draws on: wait for the activity to hand one over
+    std::unique_lock<std::recursive_mutex> surface_lock(surface_mutex);
+    surface_cv.wait(surface_lock, [] { return g_surface != nullptr || g_stop.load(); });
+    if (!g_surface) {
+        return Core::System::ResultStatus::ShutdownRequested;
+    }
+    g_window = std::make_unique<EmuWindow>(g_surface, g_surface_width, g_surface_height);
+
+    // the core re-creates its renderer on a save-state load: hold the surface for that
+    system.RegisterOnInitCallback([](bool init_start) {
+        if (init_start) {
+            surface_mutex.lock();
+            if (!g_surface) {
+                std::unique_lock<std::recursive_mutex> wait(surface_mutex, std::adopt_lock);
+                surface_cv.wait(wait, [] { return g_surface != nullptr; });
+                wait.release();
+            }
+        } else {
+            surface_mutex.unlock();
+        }
+    });
+
+    g_config = App::Load();
+    ApplyConfig(g_config);
+    SCOPE_EXIT({
+        SetAdrenoBoost(false);
+        ClearDriverMarker();
+    });
+    std::string driver_note;
+    if (auto library = ChooseGpuDriver(g_config.gpu_driver, driver_note)) {
+        g_window->SetDriverLibrary(std::move(library));   // the renderer asks its window for it
+    }
+    Frontend::RegisterDefaultApplets(system);
+    system.RegisterSoftwareKeyboard(std::make_shared<Mh4uAndroid::Keyboard>());
+    system.ApplySettings();
+
+    if (std::string error; !App::Multiplayer::StartAtBoot(error)) {
+        message = error + " The game starts without the room.";
+    }
+    LOG_INFO(Frontend, "{}", Port::PrepareBackendFor(system, game));
+    {
+        std::scoped_lock lock(g_notice_mutex);
+        g_notice = Port::BackendNotice();  // the activity shows it once the game is up
+        if (!driver_note.empty()) {
+            g_notice += (g_notice.empty() ? "" : "\n") + driver_note;
+        }
+    }
+
+    // pin this thread before the core starts its own: they take the mask from their creator
+    Common::SetCurrentThreadAffinity(
+        static_cast<Common::CpuAffinityMode>(Settings::values.cpu_affinity_mode.GetValue()));
+
+    Settings::LogSettings();
+    const auto status = system.Load(*g_window, game);
+    surface_lock.unlock();
+    if (status != Core::System::ResultStatus::Success) {
+        message = system.GetStatusDetails();
+        g_window.reset();
+        return status;
+    }
+
+    g_pause = false;
+    system.RegisterCoreLoopThreadId();
+    SCOPE_EXIT({
+        std::scoped_lock lock(surface_mutex);
+        g_window->DoneCurrent();
+        system.Shutdown();
+        g_window.reset();
+    });
+
+    // a custom driver that has run this long didn't crash on start
+    const auto driver_ok_at = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!g_stop) {
+        if (!g_driver_marker.empty() && std::chrono::steady_clock::now() >= driver_ok_at) {
+            ClearDriverMarker();
+        }
+        RunTasks();
+        App::Multiplayer::Tick();
+        if (g_pause) {
+            const float volume = Settings::values.volume.GetValue();
+            SCOPE_EXIT({ Settings::values.volume = volume; });
+            Settings::values.volume = 0;
+            std::unique_lock lock(g_pause_mutex);
+            g_pause_cv.wait(lock, [] { return !g_pause || g_stop; });
+            continue;
+        }
+        const auto result = system.RunLoop();
+        if (result == Core::System::ResultStatus::Success) {
+            continue;
+        }
+        if (result == Core::System::ResultStatus::ShutdownRequested) {
+            return result;
+        }
+        message = system.GetStatusDetails();
+        return result;
+    }
+    return Core::System::ResultStatus::Success;
+}
+
+json MemberJson(const App::Multiplayer::Member& m) {
+    return {{"nickname", m.nickname}, {"username", m.username}, {"game", m.game},
+            {"you", m.you},           {"heard", m.heard}};
+}
+
+json StatusJson() {
+    const auto s = App::Multiplayer::GetStatus();
+    json j;
+    j["phase"] = s.phase == App::Multiplayer::Phase::Off    ? "off"
+                 : s.phase == App::Multiplayer::Phase::Busy ? "busy"
+                                                            : "room";
+    j["action"] = s.action;
+    j["error"] = s.error;
+    j["hint"] = s.hint;
+    j["room_name"] = s.room_name;
+    j["host"] = s.host;
+    j["port"] = s.port;
+    j["password"] = s.password;
+    j["slots"] = s.slots;
+    j["hosting"] = s.hosting;
+    j["moderator"] = s.moderator;
+    j["nickname"] = s.nickname;
+    j["joined_in_game"] = s.joined_in_game;
+    j["lobby_note"] = s.lobby_note;
+    j["public_address"] = s.public_address;
+    j["public_checked"] = s.public_checked;
+    j["members"] = json::array();
+    for (const auto& m : s.members) {
+        j["members"].push_back(MemberJson(m));
+    }
+    j["addresses"] = json::array();
+    for (const auto& a : s.addresses) {
+        j["addresses"].push_back({{"ip", a.ip}, {"kind", a.kind}});
+    }
+    j["invite"] = s.phase == App::Multiplayer::Phase::InRoom && s.hosting && !s.addresses.empty()
+                      ? App::Invite::Format(s.addresses.front().ip, s.port, s.password)
+                      : std::string{};
+    return j;
+}
+
+} // namespace
+
+#define FN(ret, name, ...) extern "C" JNIEXPORT ret JNICALL Java_org_mh4u_port_Native_##name(JNIEnv* env, jclass, ##__VA_ARGS__)
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    Mh4uAndroid::SetVm(vm);
+    JNIEnv* env = nullptr;
+    vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    // the core's file access calls static methods of this class (storage root, raw paths)
+    jclass storage = reinterpret_cast<jclass>(env->NewGlobalRef(env->FindClass("org/mh4u/port/Storage")));
+    AndroidUtils::InitJNI(env, storage);
+    Mh4uAndroid::InitKeyboardJni();
+    return JNI_VERSION_1_6;
+}
+
+/// Once, before anything else. `privateDir` is where the code library is staged (app storage
+/// that can execute; the user folder can't).
+FN(void, init, jstring private_dir) {
+    if (g_initialised) {
+        return;
+    }
+    setenv("MH4U_PRIVATE_DIR", Str(env, private_dir).c_str(), 1);
+    Common::Log::Initialize("mh4u_log.txt");
+    Common::Log::Start();
+    Common::Log::Filter filter;
+    filter.ParseFilterString(Settings::values.log_filter.GetValue());
+    Common::Log::SetGlobalFilter(filter);
+    InputCommon::Init();
+    Network::Init();
+    g_config = App::Load();
+    if (!FileUtil::Exists(Port::OptionsPath())) {
+        FileUtil::WriteStringToFile(true, Port::OptionsPath(), Port::OptionsTemplate());
+    }
+    App::Multiplayer::Init(Core::System::GetInstance(), g_config);
+    g_initialised = true;
+}
+
+/// Where libadrenotools' hooks are (the app's native library folder) and where the GPU drivers
+/// the player imported live.
+FN(void, setDriverDirs, jstring hook_lib_dir, jstring drivers_dir) {
+    g_hook_lib_dir = Str(env, hook_lib_dir);
+    g_drivers_dir = Str(env, drivers_dir);
+}
+
+FN(jboolean, isAdreno) {
+#ifdef MH4U_ADRENOTOOLS
+    return KgslPresent();
+#else
+    return false;
+#endif
+}
+
+FN(jboolean, supportsCustomDriver) {
+    return CustomDriverSupported();
+}
+
+FN(void, surfaceChanged, jobject surface, jint width, jint height) {
+    std::scoped_lock lock(surface_mutex);
+    g_surface_width = width;
+    g_surface_height = height;
+    if (g_surface) {
+        ANativeWindow_release(g_surface);
+        g_surface = nullptr;
+    }
+    g_surface = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
+    if (!g_surface) {
+        return;
+    }
+    surface_cv.notify_all();
+    auto& system = Core::System::GetInstance();
+    if (g_window && g_window->OnSurfaceChanged(g_surface, width, height) && system.IsPoweredOn()) {
+        system.GPU().Renderer().NotifySurfaceChanged(false);
+    }
+}
+
+FN(void, surfaceDestroyed) {
+    std::scoped_lock lock(surface_mutex);
+    if (g_surface) {
+        ANativeWindow_release(g_surface);
+        g_surface = nullptr;
+        if (g_window) {
+            g_window->OnSurfaceChanged(nullptr);
+        }
+    }
+}
+
+/// Runs the game on the calling thread until it stops. Returns "" on a normal end, else the
+/// text for the player (why it didn't start, or what the port wants said). The code library's
+/// notice comes back through `notice()` below.
+FN(jstring, run, jstring game) {
+    std::string message;
+    const auto status = Run(Str(env, game), message);
+    using Status = Core::System::ResultStatus;
+    std::string out;
+    switch (status) {
+    case Status::Success:
+    case Status::ShutdownRequested:
+        out = "";
+        break;
+    case Status::ErrorGetLoader:
+    case Status::ErrorLoader_ErrorInvalidFormat:
+        out = "This file isn't a 3DS game the app can open. Choose your decrypted Monster Hunter "
+              "4 Ultimate (.3ds, .cci or .cxi).";
+        break;
+    case Status::ErrorLoader_ErrorEncrypted:
+        out = "The game file is encrypted. The port needs a decrypted dump of your own cartridge.";
+        break;
+    case Status::ErrorSystemFiles:
+        out = "Some 3DS system files are missing.";
+        break;
+    default:
+        out = message.empty() ? "The game stopped." : message;
+    }
+    return JStr(env, out);
+}
+
+FN(void, stop) {
+    if (g_stop.exchange(true)) {
+        return;
+    }
+    g_pause = false;
+    g_pause_cv.notify_all();
+    surface_cv.notify_all();
+}
+
+FN(void, setPaused, jboolean paused) {
+    g_pause = paused;
+    if (!paused) {
+        g_pause_cv.notify_all();
+    }
+}
+
+FN(jboolean, isRunning) {
+    return !g_stop;
+}
+
+FN(void, touch, jint x, jint y, jboolean down) {
+    if (g_window) {
+        g_window->OnTouch(x, y, down);
+    }
+}
+
+FN(void, touchMove, jint x, jint y) {
+    if (g_window) {
+        g_window->OnTouchMoved(x, y);
+    }
+}
+
+/// The two screens' rectangles in window pixels (top, bottom): left, top, right, bottom each;
+/// then the window's size. For the touch overlay editor and the on-screen controls.
+FN(jfloatArray, layout) {
+    jfloatArray out = env->NewFloatArray(10);
+    if (!g_window) {
+        return out;
+    }
+    const auto& l = g_window->GetFramebufferLayout();
+    const float v[10] = {
+        static_cast<float>(l.top_screen_enabled ? l.top_screen.left : 0),
+        static_cast<float>(l.top_screen_enabled ? l.top_screen.top : 0),
+        static_cast<float>(l.top_screen_enabled ? l.top_screen.right : 0),
+        static_cast<float>(l.top_screen_enabled ? l.top_screen.bottom : 0),
+        static_cast<float>(l.bottom_screen_enabled ? l.bottom_screen.left : 0),
+        static_cast<float>(l.bottom_screen_enabled ? l.bottom_screen.top : 0),
+        static_cast<float>(l.bottom_screen_enabled ? l.bottom_screen.right : 0),
+        static_cast<float>(l.bottom_screen_enabled ? l.bottom_screen.bottom : 0),
+        static_cast<float>(l.width), static_cast<float>(l.height)};
+    env->SetFloatArrayRegion(out, 0, 10, v);
+    return out;
+}
+
+/// Re-reads mh4u-app.ini and applies it to the running game. `extras`: see ApplyScreenExtras.
+FN(void, applySettings, jstring extras) {
+    const std::string extra_text = Str(env, extras);
+    Post([extra_text] {
+        g_config = App::Load();
+        ApplyConfig(g_config);
+        ApplyScreenExtras(extra_text);
+        Core::System::GetInstance().ApplySettings();
+        // the layout follows the new option at once. (OnSurfaceChanged did nothing here: the
+        // surface hadn't changed, so the layout was only worked out again at the next rotation.)
+        if (g_window) {
+            g_window->Relayout();
+        }
+    });
+    // before a game runs there is no emulation thread to take the task: do it here
+    if (g_stop) {
+        RunTasks();
+    }
+}
+
+/// A game option of mh4u.ini changed while the game runs (the port's hooks read these live).
+FN(jboolean, setGameOption, jstring key, jstring value) {
+    const std::string k = Str(env, key), v = Str(env, value);
+    Post([k, v] { Port::Hooks::SetOption(k, v); });
+    return JNI_TRUE;
+}
+
+/// The code library's note for the player ("" when all is well): shown once the game runs.
+FN(jstring, notice) {
+    std::scoped_lock lock(g_notice_mutex);
+    return JStr(env, g_notice);
+}
+
+// ── cheats (Azahar's Gateway cheat engine; the file is <user dir>/cheats/<title id>.txt) ──
+
+namespace {
+
+std::mutex g_cheat_mutex;
+
+/// The running game's program id, or 0.
+u64 CheatTitleId() {
+    u64 id = 0;
+    if (!Core::System::GetInstance().IsPoweredOn() ||
+        Core::System::GetInstance().GetAppLoader().ReadProgramId(id) != Loader::ResultStatus::Success) {
+        return 0;
+    }
+    return id;
+}
+
+void SaveCheats() {
+    if (const u64 id = CheatTitleId()) {
+        Core::System::GetInstance().CheatEngine().SaveCheatFile(id);
+    }
+}
+
+/// "" when `code` is Gateway code (lines of 8 hex digits, a space, 8 hex digits), else why not.
+std::string CheckCheatCode(const std::string& code) {
+    std::size_t at = 0;
+    int lines = 0;
+    while (at <= code.size()) {
+        const std::size_t end = std::min(code.find('\n', at), code.size());
+        std::string line = code.substr(at, end - at);
+        at = end + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+        std::size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos) continue;
+        line = line.substr(first);
+        bool ok = line.size() == 17 && line[8] == ' ';
+        for (std::size_t i = 0; ok && i < line.size(); ++i) {
+            ok = i == 8 || std::isxdigit(static_cast<unsigned char>(line[i])) != 0;
+        }
+        if (!ok) {
+            return "Not a Gateway code line: \"" + line + "\". Each line is 8 hex digits, a space, 8 hex digits.";
+        }
+        ++lines;
+    }
+    return lines ? "" : "The code is empty.";
+}
+
+std::string Normalized(std::string code) {
+    code.erase(std::remove(code.begin(), code.end(), '\r'), code.end());
+    std::string out;
+    std::size_t at = 0;
+    while (at <= code.size()) {
+        const std::size_t end = std::min(code.find('\n', at), code.size());
+        std::string line = code.substr(at, end - at);
+        at = end + 1;
+        const auto a = line.find_first_not_of(" \t");
+        if (a == std::string::npos) continue;
+        out += line.substr(a, line.find_last_not_of(" \t") - a + 1) + "\n";
+    }
+    return out;
+}
+
+} // namespace
+
+/// JSON [{"i", "name", "comments", "code", "enabled", "builtin"}]: the cheats of the running game
+/// (empty before it has started).
+FN(jstring, cheatList) {
+    std::scoped_lock lock(g_cheat_mutex);
+    nlohmann::json list = nlohmann::json::array();
+    if (CheatTitleId() != 0) {
+        const auto cheats = Core::System::GetInstance().CheatEngine().GetCheats();
+        int i = 0;
+        for (const auto& c : cheats) {
+            list.push_back({{"i", i++}, {"name", c->GetName()}, {"comments", c->GetComments()},
+                            {"code", c->GetCode()}, {"enabled", c->IsEnabled()}, {"builtin", c->IsBuiltIn()}});
+        }
+    }
+    return JStr(env, list.dump());
+}
+
+FN(jboolean, cheatSetEnabled, jint index, jboolean enabled) {
+    std::scoped_lock lock(g_cheat_mutex);
+    if (CheatTitleId() == 0) return JNI_FALSE;
+    const auto cheats = Core::System::GetInstance().CheatEngine().GetCheats();
+    if (index < 0 || static_cast<std::size_t>(index) >= cheats.size()) return JNI_FALSE;
+    cheats[static_cast<std::size_t>(index)]->SetEnabled(enabled);
+    SaveCheats();
+    return JNI_TRUE;
+}
+
+/// Adds a cheat, or replaces the one at `index` (-1 adds). "" when done, else what is wrong.
+FN(jstring, cheatSet, jint index, jstring name, jstring comments, jstring code) {
+    std::scoped_lock lock(g_cheat_mutex);
+    if (CheatTitleId() == 0) return JStr(env, "The game has not started yet.");
+    std::string n = Str(env, name), text = Normalized(Str(env, code));
+    if (n.empty()) return JStr(env, "The cheat needs a name.");
+    if (n.find_first_of("[]\n") != std::string::npos) return JStr(env, "The name can't hold [ ] or a new line.");
+    if (const std::string why = CheckCheatCode(text); !why.empty()) return JStr(env, why);
+    auto& engine = Core::System::GetInstance().CheatEngine();
+    auto cheat = std::make_shared<Cheats::GatewayCheat>(n, text, Str(env, comments));
+    if (index >= 0) {
+        const auto old = engine.GetCheats();
+        if (static_cast<std::size_t>(index) >= old.size()) return JStr(env, "That cheat is gone.");
+        cheat->SetEnabled(old[static_cast<std::size_t>(index)]->IsEnabled());
+        engine.UpdateCheat(static_cast<std::size_t>(index), std::move(cheat));
+    } else {
+        engine.AddCheat(std::move(cheat));
+    }
+    SaveCheats();
+    return JStr(env, "");
+}
+
+FN(jboolean, cheatRemove, jint index) {
+    std::scoped_lock lock(g_cheat_mutex);
+    if (CheatTitleId() == 0) return JNI_FALSE;
+    auto& engine = Core::System::GetInstance().CheatEngine();
+    if (index < 0 || static_cast<std::size_t>(index) >= engine.GetCheats().size()) return JNI_FALSE;
+    engine.RemoveCheat(static_cast<std::size_t>(index));
+    SaveCheats();
+    return JNI_TRUE;
+}
+
+FN(void, toggleQuestMap) {
+    Port::ToggleQuestMap();
+}
+
+FN(jstring, optionsPath) {
+    return JStr(env, Port::OptionsPath());
+}
+
+/// Frames per second the game draws, for the counter; speed in % of real time.
+FN(jdoubleArray, perf) {
+    jdoubleArray out = env->NewDoubleArray(2);
+    auto& system = Core::System::GetInstance();
+    if (system.IsPoweredOn()) {
+        const auto r = system.GetAndResetPerfStats();
+        const double v[2] = {r.game_fps, r.emulation_speed * 100.0};
+        env->SetDoubleArrayRegion(out, 0, 2, v);
+    }
+    return out;
+}
+
+// ── installing the game's update (a .cia) ──
+FN(jint, installCia, jstring path) {
+    return static_cast<jint>(Service::AM::InstallCIA(Str(env, path)));
+}
+
+// ── multiplayer: App::Multiplayer, as the PC app's menu uses it ──
+FN(jboolean, roomJoin, jstring host, jint port, jstring password) {
+    App::Multiplayer::JoinRequest request;
+    request.host = Str(env, host);
+    request.port = port;
+    request.password = Str(env, password);
+    return App::Multiplayer::Join(request);
+}
+
+FN(jboolean, roomHost, jint port, jstring name, jint slots, jstring password, jboolean listed) {
+    App::Multiplayer::HostRequest request;
+    request.port = port;
+    request.name = Str(env, name);
+    request.slots = slots;
+    request.password = Str(env, password);
+    request.listed = listed;
+    return App::Multiplayer::Host(request);
+}
+
+FN(jboolean, roomLeave, jboolean close) {
+    return App::Multiplayer::Leave(close);
+}
+
+FN(jboolean, roomRejoin) {
+    return App::Multiplayer::Rejoin();
+}
+
+FN(jstring, roomLast) {
+    return JStr(env, App::Multiplayer::LastRoom());
+}
+
+FN(jstring, roomStatus) {
+    return JStr(env, StatusJson().dump());
+}
+
+/// Sends a line to the room's chat. False: not in a room, or nothing to send.
+FN(jboolean, chatSend, jstring text) {
+    return App::Multiplayer::SendChat(Utf8Str(env, text));
+}
+
+/// The room's chat after line `since`, as JSON: {"seq": number of the last line, "lines": [{seq,
+/// nick, msg, you, system}]}. ASCII only (other characters as unicode escapes), as NewStringUTF needs.
+FN(jstring, chatPoll, jlong since) {
+    unsigned long long newest = 0;
+    const auto lines = App::Multiplayer::ChatSince(static_cast<unsigned long long>(since), newest);
+    json j = {{"seq", newest}, {"lines", json::array()}};
+    for (const auto& l : lines) {
+        j["lines"].push_back({{"seq", l.seq}, {"nick", l.nickname}, {"msg", l.message}, {"you", l.you}, {"system", l.system}});
+    }
+    return JStr(env, j.dump(-1, ' ', true, json::error_handler_t::replace));
+}
+
+/// "ok|host|port|password|error" for an invite code or an address.
+FN(jstring, parseInvite, jstring text) {
+    const auto room = App::Invite::Parse(Str(env, text));
+    json j = {{"ok", room.ok},     {"error", room.error}, {"host", room.host},
+              {"port", room.port}, {"password", room.password}, {"code", room.code}};
+    return JStr(env, j.dump());
+}
+
+FN(jstring, formatInvite, jstring host, jint port, jstring password) {
+    return JStr(env, App::Invite::Format(Str(env, host), port, Str(env, password)));
+}
+
+FN(jboolean, validNickname, jstring name) {
+    return App::Multiplayer::ValidNickname(Str(env, name));
+}
+
+/// A lobby's rooms as JSON (blocks: call off the main thread).
+FN(jstring, lobbyRooms, jstring url) {
+    const auto list = Launcher::Lobby::Fetch(Str(env, url));
+    json j = {{"ok", list.ok}, {"error", list.error}, {"rooms", json::array()}};
+    for (const auto& r : list.rooms) {
+        j["rooms"].push_back({{"name", r.name},
+                              {"description", r.description},
+                              {"owner", r.owner},
+                              {"address", r.address},
+                              {"port", r.port},
+                              {"max_players", r.max_players},
+                              {"password", r.password},
+                              {"players", r.players},
+                              {"player_games", r.player_games},
+                              {"game", r.game},
+                              {"mh4u", r.mh4u}});
+    }
+    return JStr(env, j.dump());
+}
+
+// ── the combo engine's text form (input bindings), kept native so Kotlin stays thin ──
+// (jni_input.cpp: Java_org_mh4u_port_MH4UInput_*)

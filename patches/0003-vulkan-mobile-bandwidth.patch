@@ -1,0 +1,299 @@
+diff -ruN a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp	2026-10-25 18:10:28.611294101 +0000
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp	2026-10-25 18:14:53.841483150 +0000
+@@ -164,6 +164,18 @@
+     CollectToolingInfo();
+     CreateCustomFormatTable();
+     CreateAttribTable();
++
++    const char* no_storage = std::getenv("AZAHAR_VK_NO_STORAGE");
++    const bool no_storage_requested = no_storage && no_storage[0] == '1';
++    LOG_INFO(Render_Vulkan,
++             "GPU \"{}\", driver {} {}; null descriptors: {}; RGBA8 storage opt-out: {}; "
++             "pass flush on this driver: {}",
++             properties.deviceName.data(), vk::to_string(driver_id), GetDriverVersionName(),
++             null_descriptor ? "yes" : "no",
++             !no_storage_requested ? "off"
++             : null_descriptor     ? "ACTIVE"
++                                   : "requested but ignored (driver lacks nullDescriptor)",
++             ShouldFlush() ? "yes" : "no");
+ }
+ 
+ Instance::~Instance() {
+@@ -252,7 +264,8 @@
+     }
+     // Storage flag is only needed for shadow rendering with RGBA8 texture.
+     // Keeping it disables can boost performance on mobile drivers.
+-    if (supports_storage && pixel_format == VideoCore::PixelFormat::RGBA8) {
++    if (supports_storage && pixel_format == VideoCore::PixelFormat::RGBA8 &&
++        !DropRgba8Storage()) {
+         best_usage |= vk::ImageUsageFlagBits::eStorage;
+     }
+ 
+diff -ruN a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
+--- a/src/video_core/renderer_vulkan/vk_instance.h	2026-10-25 18:10:28.611249067 +0000
++++ b/src/video_core/renderer_vulkan/vk_instance.h	2026-10-25 18:14:53.840120794 +0000
+@@ -4,6 +4,8 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++#include <cstdlib>
+ #include <span>
+ 
+ #include "video_core/pica/regs_pipeline.h"
+@@ -36,6 +38,10 @@
+     auto operator<=>(const FormatTraits&) const = default;
+ };
+ 
++/// Shadow draws/reads that met a surface without storage usage (AZAHAR_VK_NO_STORAGE), shown in
++/// the render stats log line.
++inline std::atomic<u32> g_shadow_storage_misses{};
++
+ class Instance {
+ public:
+     struct NoInit {};
+@@ -156,6 +162,18 @@
+         return null_descriptor;
+     }
+ 
++    /// MH4U port: when AZAHAR_VK_NO_STORAGE=1, RGBA8 surfaces are created without storage usage
++    /// and the mutable-format flag, which (on tile-based mobile GPUs) lets the driver keep
++    /// framebuffer compression on. Only surfaces flagged as shadow sources keep storage. Needs
++    /// null descriptors: a storage-less surface bound for shadows becomes a null view instead.
++    bool DropRgba8Storage() const {
++        static const bool requested = [] {
++            const char* v = std::getenv("AZAHAR_VK_NO_STORAGE");
++            return v && v[0] == '1';
++        }();
++        return requested && null_descriptor;
++    }
++
+     /// Returns true when VK_EXT_fragment_shader_interlock is supported
+     bool IsFragmentShaderInterlockSupported() const {
+         return fragment_shader_interlock;
+diff -ruN a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp	2026-10-25 18:10:28.611359304 +0000
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp	2026-10-25 18:14:53.845456700 +0000
+@@ -568,6 +568,21 @@
+         return true;
+     }
+ 
++    if (shadow_rendering && !framebuffer->ImageView(SurfaceType::Color)) {
++        // AZAHAR_VK_NO_STORAGE: this target was created without storage usage, so it cannot take
++        // shadow writes. Skipping the draw loses those shadows; turn the option off if the game
++        // uses them.
++        static bool warned = false;
++        ++g_shadow_storage_misses;
++        if (!warned) {
++            warned = true;
++            LOG_WARNING(Render_Vulkan,
++                        "Shadow rendering into a surface without storage usage skipped "
++                        "(AZAHAR_VK_NO_STORAGE); turn that option off if shadows are missing");
++        }
++        return true;
++    }
++
+     pipeline_info.state.attachments.color = framebuffer->Format(SurfaceType::Color);
+     pipeline_info.state.attachments.depth = framebuffer->Format(SurfaceType::Depth);
+ 
+@@ -732,7 +747,18 @@
+         const u32 shadow_texture_unit = regs.lighting.config0.shadow_selector.Value();
+         const auto shadow_texture = regs.texturing.GetTextures()[shadow_texture_unit];
+         Surface& shadow_surface = res_cache.GetTextureSurface(shadow_texture);
+-        update_queue.AddStorageImage(utility_set, 0, shadow_surface.StorageView());
++        const vk::ImageView shadow_view = shadow_surface.StorageView();
++        if (!shadow_view) {
++            static bool warned = false;
++            ++g_shadow_storage_misses;
++            if (!warned) {
++                warned = true;
++                LOG_WARNING(Render_Vulkan,
++                            "Shadow texture without storage usage read as empty "
++                            "(AZAHAR_VK_NO_STORAGE); turn that option off if shadows are wrong");
++            }
++        }
++        update_queue.AddStorageImage(utility_set, 0, shadow_view);
+     } else {
+         if (instance.IsNullDescriptorSupported()) {
+             update_queue.AddStorageImage(utility_set, 0, vk::ImageView{});
+diff -ruN a/src/video_core/renderer_vulkan/vk_render_manager.cpp b/src/video_core/renderer_vulkan/vk_render_manager.cpp
+--- a/src/video_core/renderer_vulkan/vk_render_manager.cpp	2026-10-25 18:10:28.611379337 +0000
++++ b/src/video_core/renderer_vulkan/vk_render_manager.cpp	2026-10-25 18:14:53.846690635 +0000
+@@ -2,7 +2,10 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <chrono>
++#include <cstdlib>
+ #include "common/assert.h"
++#include "common/logging/log.h"
+ #include "video_core/rasterizer_cache/pixel_format.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_render_manager.h"
+@@ -11,11 +14,47 @@
+ 
+ namespace Vulkan {
+ 
+-constexpr u32 MinDrawsToFlush = 20;
++// Draws in a render pass before its end is flushed on Mali/Qualcomm drivers. AZAHAR_VK_FLUSH_DRAWS
++// overrides the default (20), to compare values on a device without rebuilding.
++static const u32 MinDrawsToFlush = [] {
++    if (const char* v = std::getenv("AZAHAR_VK_FLUSH_DRAWS")) {
++        return static_cast<u32>(std::strtoul(v, nullptr, 10));
++    }
++    return 20u;
++}();
+ 
+ using VideoCore::PixelFormat;
+ using VideoCore::SurfaceType;
+ 
++namespace {
++// Counters for a log line every few seconds (Settings > Log: Render.Vulkan at Info): render
++// passes and draws per second show how much work reaches the GPU and how it is batched.
++struct PassStats {
++    u64 draws{};
++    u64 passes{};
++    u64 flushes{};
++    std::chrono::steady_clock::time_point since{std::chrono::steady_clock::now()};
++
++    void Report() {
++        const auto now = std::chrono::steady_clock::now();
++        const double secs = std::chrono::duration<double>(now - since).count();
++        if (secs < 5.0) {
++            return;
++        }
++        if (passes > 0) {
++            LOG_INFO(Render_Vulkan,
++                     "render stats: {:.0f} passes/s, {:.0f} draws/s ({:.1f} per pass), {:.1f} "
++                     "flushes/s, shadow-storage misses so far: {}",
++                     passes / secs, draws / secs, static_cast<double>(draws) / passes,
++                     flushes / secs, g_shadow_storage_misses.load());
++        }
++        draws = passes = flushes = 0;
++        since = now;
++    }
++};
++PassStats pass_stats;
++} // namespace
++
+ RenderManager::RenderManager(const Instance& instance, Scheduler& scheduler)
+     : instance{instance}, scheduler{scheduler} {}
+ 
+@@ -47,6 +86,7 @@
+ }
+ 
+ void RenderManager::BeginRendering(const RenderPass& new_pass) {
++    pass_stats.draws++;
+     if (pass == new_pass) [[likely]] {
+         num_draws++;
+         return;
+@@ -123,6 +163,9 @@
+                                num_barriers, barriers.data());
+     });
+ 
++    pass_stats.passes++;
++    pass_stats.Report();
++
+     // Reset state.
+     pass.render_pass = VK_NULL_HANDLE;
+     images = {};
+@@ -133,6 +176,7 @@
+     // Testing has shown this has a significant effect on rendering performance
+     if (num_draws > MinDrawsToFlush && instance.ShouldFlush()) {
+         scheduler.Flush();
++        pass_stats.flushes++;
+         num_draws = 0;
+     }
+ }
+diff -ruN a/src/video_core/renderer_vulkan/vk_texture_runtime.cpp b/src/video_core/renderer_vulkan/vk_texture_runtime.cpp
+--- a/src/video_core/renderer_vulkan/vk_texture_runtime.cpp	2026-10-25 18:10:28.611330998 +0000
++++ b/src/video_core/renderer_vulkan/vk_texture_runtime.cpp	2026-10-25 18:14:53.844225875 +0000
+@@ -767,6 +767,19 @@
+     u32 num_images{};
+     std::array<vk::Image, 2> raw_images;
+ 
++    // Storage usage is added when available in case it is found out later that this is a
++    // shadow-source texture that will get used in the utility descriptor-set. With
++    // AZAHAR_VK_NO_STORAGE only surfaces already known to be shadow sources get it (this must
++    // be worked out before the local `flags` below hides the surface's own).
++    has_storage = traits.native == vk::Format::eR8G8B8A8Unorm && traits.storage_support &&
++                  (!instance.DropRgba8Storage() ||
++                   True(flags & VideoCore::SurfaceFlagBits::ShadowSource));
++
++    if (instance.DropRgba8Storage() && !has_storage) {
++        // the mutable format is only there for the R32 storage view
++        is_mutable = false;
++    }
++
+     vk::ImageCreateFlags flags{};
+     if (texture_type == VideoCore::TextureType::CubeMap) {
+         flags |= vk::ImageCreateFlagBits::eCubeCompatible;
+@@ -782,9 +795,7 @@
+     if (is_color) {
+         usage |= vk::ImageUsageFlagBits::eColorAttachment;
+     }
+-    if (traits.native == vk::Format::eR8G8B8A8Unorm && traits.storage_support) {
+-        // Add Storage-usage support when available in case it is found out later that this is a
+-        // shadow-source texture that will get used in the utility descriptor-set
++    if (has_storage) {
+         usage |= vk::ImageUsageFlagBits::eStorage;
+     }
+ 
+@@ -1119,7 +1130,8 @@
+ 
+     res_scale = new_scale;
+ 
+-    const bool is_mutable = pixel_format == VideoCore::PixelFormat::RGBA8;
++    const bool is_mutable = pixel_format == VideoCore::PixelFormat::RGBA8 &&
++                            (has_storage || !instance.DropRgba8Storage());
+ 
+     vk::ImageCreateFlags flags{};
+     if (texture_type == VideoCore::TextureType::CubeMap) {
+@@ -1129,8 +1141,14 @@
+         flags |= vk::ImageCreateFlagBits::eMutableFormat;
+     }
+ 
++    // traits.usage has no storage in AZAHAR_VK_NO_STORAGE mode: a surface that was given it
++    // (a shadow source) keeps it on the scaled image
++    auto scaled_usage = traits.usage;
++    if (has_storage) {
++        scaled_usage |= vk::ImageUsageFlagBits::eStorage;
++    }
+     handles[Type::Scaled].Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type,
+-                                 traits.native, traits.usage, flags, traits.aspect, false,
++                                 traits.native, scaled_usage, flags, traits.aspect, false,
+                                  DebugName(true));
+     current = Type::Scaled;
+ 
+diff -ruN a/src/video_core/renderer_vulkan/vk_texture_runtime.h b/src/video_core/renderer_vulkan/vk_texture_runtime.h
+--- a/src/video_core/renderer_vulkan/vk_texture_runtime.h	2026-10-25 18:10:28.611315676 +0000
++++ b/src/video_core/renderer_vulkan/vk_texture_runtime.h	2026-10-25 18:14:53.842726412 +0000
+@@ -242,10 +242,19 @@
+ 
+     /// Returns the R32 image view used for atomic load/store.
+     vk::ImageView StorageView() noexcept {
++        if (!has_storage && instance.DropRgba8Storage()) {
++            // created without storage usage (see Instance::DropRgba8Storage): a null view
++            return vk::ImageView{};
++        }
+         is_storage = true;
+         return ImageView(ViewType::Storage);
+     }
+ 
++    /// Whether the image was created with storage usage
++    [[nodiscard]] bool HasStorage() const noexcept {
++        return has_storage;
++    }
++
+     /// Uploads pixel data in staging to a rectangle region of the surface texture
+     void Upload(const VideoCore::BufferTextureCopy& upload, const VideoCore::StagingData& staging);
+ 
+@@ -288,6 +297,7 @@
+     vk::UniqueImageView storage_view;
+     bool is_framebuffer{};
+     bool is_storage{};
++    bool has_storage{};
+ };
+ 
+ class Framebuffer : public VideoCore::FramebufferParams {

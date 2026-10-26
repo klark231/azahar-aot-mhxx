@@ -1,0 +1,56 @@
+// The game's window on Android: a Surface the Kotlin side hands over, drawn on by Azahar's
+// Vulkan renderer. Touches on the touch screen come in as window pixels. (Modelled on Azahar's
+// own Android window; one window, Vulkan only, the system's Vulkan driver.)
+#pragma once
+
+#include <memory>
+
+#include "core/frontend/emu_window.h"
+
+struct ANativeWindow;
+
+namespace Mh4uAndroid {
+
+class EmuWindow final : public Frontend::EmuWindow {
+public:
+    /// `width` and `height` are the surface's size as the activity knows it (0: ask the window).
+    explicit EmuWindow(ANativeWindow* surface, int width = 0, int height = 0);
+    ~EmuWindow() override = default;
+
+    /// The surface changed (rotation, the app came back). False if nothing differs. The size is
+    /// the one the activity was told (surfaceChanged): ANativeWindow_getWidth/Height can still
+    /// give the old one for a while after a rotation, which laid the screens out for the
+    /// wrong orientation (0: ask the window anyway).
+    bool OnSurfaceChanged(ANativeWindow* surface, int width = 0, int height = 0);
+
+    /// Works the screen layout out again for the window as it is: the layout options changed.
+    void Relayout() { Resize(); }
+
+    void OnTouch(int x, int y, bool down);
+    void OnTouchMoved(int x, int y);
+
+    /// A Vulkan driver loaded from the app's own folder (libadrenotools); none: the system's.
+    void SetDriverLibrary(std::shared_ptr<Common::DynamicLibrary> library) {
+        driver_library = std::move(library);
+    }
+    std::shared_ptr<Common::DynamicLibrary> GetDriverLibrary() override {
+        return driver_library;
+    }
+
+    void PollEvents() override {}
+    void MakeCurrent() override {}
+    void DoneCurrent() override {}
+    std::unique_ptr<GraphicsContext> CreateSharedContext() const override;
+
+    int Width() const { return width; }
+    int Height() const { return height; }
+
+private:
+    void Resize();
+
+    int width = 0;
+    int height = 0;
+    std::shared_ptr<Common::DynamicLibrary> driver_library;
+};
+
+} // namespace Mh4uAndroid
