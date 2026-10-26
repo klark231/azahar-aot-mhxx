@@ -49,7 +49,7 @@ echo "== repo: $REPO (private), release: $TAG"
 
 # ---------------------------------------------------------------- .gitignore
 # The shipped .gitignore has "*.patch", which would silently leave out patches/*.patch and
-# mh4u/port/azahar/azahar-android.patch: android-aot applies them and would fail. azahar/ and
+# mhxx/port/azahar/azahar-android.patch: android-aot applies them and would fail. azahar/ and
 # reference/ are not needed (CI checks out your fork itself, README step 0).
 sed -i.orig '/^\*\.patch$/d' .gitignore && rm -f .gitignore.orig
 for d in /azahar/ /reference/; do grep -qx "$d" .gitignore || echo "$d" >> .gitignore; done
@@ -59,7 +59,7 @@ for d in /azahar/ /reference/; do grep -qx "$d" .gitignore || echo "$d" >> .giti
 if [ -z "$(git config user.name || true)" ]; then git config user.name "$OWNER"; fi
 if [ -z "$(git config user.email || true)" ]; then git config user.email "${USER_ID}+${OWNER}@users.noreply.github.com"; fi
 git add -A
-n="$(git ls-files 'patches/*.patch' 'mh4u/port/azahar/azahar-android.patch' | wc -l | tr -d ' ')"
+n="$(git ls-files 'patches/*.patch' 'mhxx/port/azahar/azahar-android.patch' | wc -l | tr -d ' ')"
 [ "$n" -ge 7 ] || die "build patches are missing from the commit ($n found, expected 7)"
 bad="$(git ls-files | grep -Ei '\.(3ds|cia|cxi|cci|so|jks)$' || true)"
 [ -z "$bad" ] || die "game data or keys would be committed: $bad"

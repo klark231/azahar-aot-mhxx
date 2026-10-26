@@ -3,7 +3,7 @@ name: android-aot
 # Builds the Android APK: the MH4U app + Azahar core (your AzaharPlus fork) + both CPU backends:
 # the MH4U-specific recompiled code and the generic 3dsrecomp AOT backend (aot/).
 # The game's code library is NOT built here: use the library-aot workflow (3dsrecomp, any
-# title) or mh4u/.github/workflows/library.yml (MH4U's own recompiler).
+# title) or mhxx/.github/workflows/library.yml (MH4U's own recompiler).
 
 on:
   workflow_dispatch:
@@ -47,7 +47,7 @@ jobs:
       - name: Apply the patches (MH4U Android patch, then the CRO observer for the AOT backend, then the Vulkan bandwidth options)
         working-directory: azahar
         run: |
-          for p in ../repo/mh4u/port/azahar/azahar-android.patch ../repo/patches/0002-ldr-ro-cro-observer.patch ../repo/patches/0003-vulkan-mobile-bandwidth.patch ../repo/patches/0004-vulkan-wait-stats-pools-shadow.patch ../repo/patches/0005-vulkan-storage-modes.patch ../repo/patches/0006-per-start-options-and-audio-driver.patch; do
+          for p in ../repo/mhxx/port/azahar/azahar-android.patch ../repo/patches/0002-ldr-ro-cro-observer.patch ../repo/patches/0003-vulkan-mobile-bandwidth.patch ../repo/patches/0004-vulkan-wait-stats-pools-shadow.patch ../repo/patches/0005-vulkan-storage-modes.patch ../repo/patches/0006-per-start-options-and-audio-driver.patch; do
             if git apply --check "$p" 2>/dev/null; then
               git apply "$p" && echo "applied $p"
             elif git apply --reverse --check "$p" 2>/dev/null; then
@@ -103,7 +103,7 @@ jobs:
           fi
 
       - name: Build release APK
-        working-directory: repo/mh4u/port/android
+        working-directory: repo/mhxx/port/android
         env:
           MH4U_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           MH4U_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -121,7 +121,7 @@ jobs:
       - name: Show the signature
         run: |
           APKSIGNER=$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/35.0.0/apksigner)
-          for apk in repo/mh4u/port/android/app/build/outputs/apk/release/*.apk; do
+          for apk in repo/mhxx/port/android/app/build/outputs/apk/release/*.apk; do
             echo "$apk"; "$APKSIGNER" verify --print-certs "$apk" | grep -E "SHA-256|Signer #1 certificate DN"
           done
           rm -f "$RUNNER_TEMP/mh4u-release.jks"
@@ -129,11 +129,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: azahar-aot-android
-          path: repo/mh4u/port/android/app/build/outputs/apk/release/*.apk
+          path: repo/mhxx/port/android/app/build/outputs/apk/release/*.apk
 
       - name: Attach to the release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: repo/mh4u/port/android/app/build/outputs/apk/release/*.apk
+          files: repo/mhxx/port/android/app/build/outputs/apk/release/*.apk
           draft: true

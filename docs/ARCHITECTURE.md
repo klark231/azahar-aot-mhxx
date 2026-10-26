@@ -48,12 +48,12 @@
 - Multi-core (N3DS): cores run in sequence on one host thread, as in Azahar.
 
 ## Mapping MH4U-Android onto this
-- Its CPU backend (`mh4u/port/src/arm_recomp.cpp`, fibers + own ABI) is **replaced** by `ARM_AOT`.
-- Its Python recompiler (`mh4u/tools/recomp`) is replaced by 3dsrecomp for the CPU path; MH4U-specific
+- Its CPU backend (`mhxx/port/src/arm_recomp.cpp`, fibers + own ABI) is **replaced** by `ARM_AOT`.
+- Its Python recompiler (`mhxx/tools/recomp`) is replaced by 3dsrecomp for the CPU path; MH4U-specific
   code mods become `--overrides` C files (`recomp/docs/overrides.md`, `RECOMP_OVERRIDE(addr)`), which is
-  where its 60 fps / widescreen / HUD hooks (`mh4u/port/src/hooks.cpp`) have to be ported to.
-- Reusable as-is from `mh4u/port/android`: Compose app, launcher, controls, multiplayer UI; and
-  `mh4u/port/azahar/azahar-android.patch` (verified to apply to this Azahar tree) for the renderer/
+  where its 60 fps / widescreen / HUD hooks (`mhxx/port/src/hooks.cpp`) have to be ported to.
+- Reusable as-is from `mhxx/port/android`: Compose app, launcher, controls, multiplayer UI; and
+  `mhxx/port/azahar/azahar-android.patch` (verified to apply to this Azahar tree) for the renderer/
   layout/network changes. It conflicts conceptually with `patches/0001` only in `core.cpp/core.h`
   (its `SetCPUFactory` has no ExclusiveMonitor parameter) — pick one when merging.
 - Zakuro: use its `recompiled.rs` as the behavioural reference; its `hints` mechanism

@@ -1,8 +1,8 @@
 # The MH4U port's options on a 3dsrecomp library
 
 Frame-rate cap, widescreen, touch screen overlay, screen filters, the skip button and the other
-options in the app's Settings are the port's **hooks** (`mh4u/port/src/hooks.cpp`). They attach to
-hook points listed in `mh4u/config/hooks.txt`. A library made by 3dsrecomp has no hook points of
+options in the app's Settings are the port's **hooks** (`mhxx/port/src/hooks.cpp`). They attach to
+hook points listed in `mhxx/config/hooks.txt`. A library made by 3dsrecomp has no hook points of
 its own, so until now none of those options did anything on it.
 
 ## How it works now
@@ -12,7 +12,7 @@ its own, so until now none of those options did anything on it.
    function when no hook is set.
 2. Build the library with those overrides: set the workflow's **overrides** input to
    `overrides/mh4u` (or `--overrides overrides/mh4u` on the command line).
-3. When the app loads the library, `mh4u/port/src/hooks_aot.cpp` sets the hooks in the library's
+3. When the app loads the library, `mhxx/port/src/hooks_aot.cpp` sets the hooks in the library's
    `azahar_aot_hooks[]` and runs `hooks.cpp` unchanged: each call's registers and flags are put
    in an `RCtx` for the hook and copied back when it returns.
 

@@ -1,3 +1,17 @@
+# azahar-aot (MHXX)
+
+## MHXX quick start
+
+1. Release `game-data` of this private repo holds your decrypted dump: `game.3ds.part-00`,
+   `game.3ds.part-01`, ... (the game, split under 2 GiB) and `update.cia`.
+2. Actions → **library-aot** → Run (release_tag `game-data`). Artifact `aot-code-library` has
+   `<TITLEID>.so`.
+3. Actions → **android-aot** → Run. Artifact `azahar-aot-android` is the signed APK
+   (the `mhxx/` folder is the Android app; its package names still say mh4u inside).
+4. Put the `.so` in the Azahar user folder under `aot/`, or pick it in the app's Setup screen.
+
+---
+
 # azahar-aot
 
 One project from four:
@@ -8,7 +22,7 @@ One project from four:
 | `recomp/` | 3dsrecomp | **The AOT compiler**: turns a game's ARM/Thumb/VFP code (exe + CRO modules) into C → `<TITLEID>.so` (interface ABI 4, `recomp/docs/interface.md`). |
 | `aot/` | **new** | **The glue**: `ARM_AOT`, an Azahar CPU backend that runs those libraries, and `Aot::Library`, the host side of the ABI (C++ port of `recomp/abi`). |
 | `reference/zakuro/` | Zakuro | **Reference host** (Rust): how a complete emulator drives the ABI (`crates/zakuro-core/src/recompiled.rs`, `loader.rs`, `services/ldr_ro.rs`). Not built here. |
-| `mh4u/` | MH4U-Android | **The app + game layer** (its Android app builds in your CI; now also loads AOT libraries): first AOT-on-Azahar port (own game-specific ABI), Android app, hooks, widescreen/60fps research. Its hooks become 3dsrecomp *overrides*. |
+| `mhxx/` | MH4U-Android | **The app + game layer** (its Android app builds in your CI; now also loads AOT libraries): first AOT-on-Azahar port (own game-specific ABI), Android app, hooks, widescreen/60fps research. Its hooks become 3dsrecomp *overrides*. |
 
 CPU = AOT. GPU, audio, network, filesystem, kernel = Azahar. Code AOT doesn't cover = Azahar's JIT.
 See `docs/ARCHITECTURE.md` for how it works and `docs/STATUS.md` for what is and isn't verified.
@@ -16,7 +30,7 @@ See `docs/ARCHITECTURE.md` for how it works and `docs/STATUS.md` for what is and
 ## Build with GitHub Actions (same flow you already use for MH4U-Android)
 
 Push this folder to your **private** repo (you can delete `azahar/` and `reference/`: CI pulls your
-AzaharPlus fork, `klark231/AzaharPlus@locale-translations`, exactly like `mh4u/.github/workflows/android.yml`).
+AzaharPlus fork, `klark231/AzaharPlus@locale-translations`, exactly like `mhxx/.github/workflows/android.yml`).
 
 0. **Which file?** MH4U: its **update .cia** (`update.cia`) with workflow **library-mh4u** — as before, and the
    app picks this library first (it has the hooks). Any other game: its **base game** image (`game.3ds`/`.cia`/`.cxi`)
@@ -26,9 +40,9 @@ AzaharPlus fork, `klark231/AzaharPlus@locale-translations`, exactly like `mh4u/.
 1. **Library** (any game other than MH4U): upload your decrypted dump as `game.3ds` / `game.cia` / `game.cxi` to a
    release named `game-data`, then run **library-aot** (`.github/workflows/library-aot.yml`).
    It builds 3dsrecomp, recompiles the game and compiles it with the NDK → artifact `aot-code-library`
-   (`<TITLEID>.so`). MH4U's own recompiler workflow (`mh4u/.github/workflows/library.yml`) still works.
+   (`<TITLEID>.so`). MH4U's own recompiler workflow (`mhxx/.github/workflows/library.yml`) still works.
 2. **APK**: run **android-aot** (`.github/workflows/android-aot.yml`). It applies
-   `mh4u/port/azahar/azahar-android.patch` + `patches/0002-ldr-ro-cro-observer.patch` to your fork and
+   `mhxx/port/azahar/azahar-android.patch` + `patches/0002-ldr-ro-cro-observer.patch` to your fork and
    builds the MH4U app, which now contains both backends.
 3. **On the phone**: put the `.so` in the Azahar user folder under `aot/` (`aot/<TITLEID>.so`); the app copies
    it into its private storage itself. Start the game. Log line to look for:

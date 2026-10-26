@@ -4,7 +4,7 @@
 - `Aot::Library` (open, ABI check, binary-search lookup, Thumb entries, module placement, FNV-1a piece
   hashing, stale marking, cache invalidation) against a hand-built ABI-4 library: `aot/tests/run.sh` passes.
 - `patches/0001-*.patch` applies cleanly to the bundled Azahar tree (`git apply --check`).
-- `mh4u/port/azahar/azahar-android.patch` + `patches/0002` apply to it together; `0001`+`0002` apply to it for stock Azahar. (The PC patch `azahar.patch` does not apply: 2 hunks drift.)
+- `mhxx/port/azahar/azahar-android.patch` + `patches/0002` apply to it together; `0001`+`0002` apply to it for stock Azahar. (The PC patch `azahar.patch` does not apply: 2 hunks drift.)
 - Both workflows parse as YAML; they have not run.
 - `recomp.h` compiles as C++ (needed by the backend).
 
