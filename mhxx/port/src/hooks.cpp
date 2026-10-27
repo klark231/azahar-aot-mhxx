@@ -1318,6 +1318,21 @@ constexpr ScreenFilter SCREEN_FILTERS[] = {
     {0x00e63ac4, "image plane range", 0},
     {0x00e60ff8, "outline", 0},
     {0x00e611a4, "TV noise", 0},
+    // MHXX 0004000000197100 (update 4.8.0): class vtables, docs/research/mhxx-hooks.md
+    {0x00cc7c3c, "bloom", FILTER_BLOOM},
+    {0x00ce7ad0, "motion blur", FILTER_MOTION_BLUR},
+    {0x00cc0a2c, "depth of field", FILTER_DEPTH_OF_FIELD},
+    {0x00cc7c8c, "bokeh", FILTER_DEPTH_OF_FIELD},
+    {0x00ce80ec, "radial blur", FILTER_RADIAL_BLUR},
+    {0x00ce3b78, "multi blur", FILTER_MOTION_BLUR},
+    {0x00cc2730, "haze", FILTER_HAZE},
+    {0x00cc7cdc, "colour", 0},
+    {0x00cc2634, "fade", 0},
+    {0x00ce3a2c, "cross-fade", 0},
+    {0x00ce7a80, "image plane", 0},
+    {0x00cf3da4, "image plane range", 0},
+    {0x00ccde50, "outline", 0},
+    {0x00cdb41c, "TV noise", 0},
 };
 static_assert(std::size(SCREEN_FILTERS) <= 32);
 u32 filters_drawn = 0, filters_skipped = 0;  // bits: SCREEN_FILTERS index, since the last log line
@@ -1376,6 +1391,7 @@ struct Hook {
 };
 constexpr Hook HOOKS[] = {
     {0x006442f8, "sMain::updateFrameTiming", UpdateFrameTiming},
+    {0x0088e120, "sMain::updateFrameTiming", UpdateFrameTiming},  // MHXX
     {0x00af5250, "sMhMain::frame", Frame},
     {0x00c46380, "uMhCamera::getProjMatrix", GetProjMatrix},
     {0x002535f8, "uFreeCamera::getProjMatrix", GetProjMatrix},
@@ -1405,6 +1421,19 @@ constexpr Hook HOOKS[] = {
     {0x0040a218, "uImagePlaneFilterRange::render", FilterRender},
     {0x003808ac, "uOutlineFilter::render", FilterRender},
     {0x00385c34, "uTVNoiseFilter::render", FilterRender},
+    // MHXX 0004000000197100 (update 4.8.0)
+    {0x002d1ff4, "uBloomFilter::render", FilterRender},
+    {0x0059ea20, "uMotionBlurFilter::render", FilterRender},
+    {0x001e1ebc, "uDOFFilter::render", FilterRender},
+    {0x002d3294, "uBokehFilter::render", FilterRender},
+    {0x005a65b8, "uRadialBlurFilter::render", FilterRender},
+    {0x002d851c, "uMultiBlurFilter::render", FilterRender},
+    {0x00257ad0, "uHazeFilter::render", FilterRender},
+    {0x002d4688, "uColorFilter::render", FilterRender},
+    {0x0054d850, "uCrossFadeFilter::render", FilterRender},
+    {0x0059d130, "uImagePlaneFilter::render", FilterRender},
+    {0x0046ad7c, "uOutlineFilter::render", FilterRender},
+    {0x004a0f80, "uTVNoiseFilter::render", FilterRender},
 };
 
 } // namespace

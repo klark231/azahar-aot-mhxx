@@ -1,0 +1,18 @@
+# MHXX hook points (Monster Hunter XX JPN, title 0004000000197100, update v4.8.0 = title version 4224).
+# Same format as hooks.txt. Found by static analysis of the update's code: class-name string ->
+# DTI static initializer -> getDTI -> vtable -> slot 12 (render). Checked against the MH4U data: instance
+# sizes agree (uBloomFilter 0x288, uBokehFilter 0x78, uColorFilter 0x50), uFilter's own render is a bare
+# `bx lr` (0x873f84), uColorFilter and uFadeFilter share one render. See docs/research/mhxx-hooks.md.
+0x0088e120 sMain::updateFrameTiming  # frame-rate cap: mh4u.ini  fps = 60  (writes sMain+0x30 on entry)
+0x002d1ff4 uBloomFilter::render  # bloom
+0x0059ea20 uMotionBlurFilter::render  # motion blur
+0x001e1ebc uDOFFilter::render  # depth of field
+0x002d3294 uBokehFilter::render  # bokeh
+0x005a65b8 uRadialBlurFilter::render  # radial blur
+0x002d851c uMultiBlurFilter::render  # multi blur
+0x00257ad0 uHazeFilter::render  # heat haze
+0x002d4688 uColorFilter::render  # colour, fades (uFadeFilter too; trace only)
+0x0054d850 uCrossFadeFilter::render  # cross-fade (trace only)
+0x0059d130 uImagePlaneFilter::render  # image plane (trace only); uImagePlaneFilterRange enters through a nop at 0x59d12c that falls into it
+0x0046ad7c uOutlineFilter::render  # outline (trace only)
+0x004a0f80 uTVNoiseFilter::render  # TV noise (trace only)

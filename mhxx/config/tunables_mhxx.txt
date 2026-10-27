@@ -1,0 +1,2 @@
+# MHXX: no tunables yet. MH4U's three are widescreen immediates; their MHXX counterparts are not verified.
+# Format as tunables.txt: <address> <original immediate> <name>  # what it is
