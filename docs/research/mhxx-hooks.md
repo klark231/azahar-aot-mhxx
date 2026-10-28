@@ -49,6 +49,14 @@ from it, stores the delta at +0x5c (0x88e58c), and sleeps the rest (microseconds
 host's UpdateFrameTiming (write the cap into r0+0x30 on entry) therefore works unchanged:
 put `fps = 60` in mh4u.ini in the user folder.
 
+## Main loop (verified)
+The class the game runs is `sFestaMain` (DTI 0xd85b68, size 0x420, subclass of sMain; MH4U's is sMhMain).
+Its constructor 0x1cc558 calls sMain's constructor, stores `this` at 0xd3e238, and the DTI factory
+(0xa55c74) creates it. Its vtable (0xcc069c) slot 7 is **0x1cbe20**: it calls the limiter (0x88e120) with
+`this`, then runs the per-frame subsystems through their vtables. This is MH4U's `sMhMain::frame` (0xaf5250).
+It is hooked with a small `FrameMhxx` (raises the emulated refresh rate for fps > 60, refreshes the layout
+once); MH4U's `Frame` is not reused because it reads MH4U-only globals.
+
 ## Not found
 - `getProjMatrix` of the cameras (MtMatrix::perspective caller) and `nDraw::Scene::Scene`: the cheap
   fingerprints (floats at +0x30, 240/400 immediates, field-store patterns) match too many places.

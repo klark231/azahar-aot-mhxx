@@ -4,6 +4,7 @@
 # sizes agree (uBloomFilter 0x288, uBokehFilter 0x78, uColorFilter 0x50), uFilter's own render is a bare
 # `bx lr` (0x873f84), uColorFilter and uFadeFilter share one render. See docs/research/mhxx-hooks.md.
 0x0088e120 sMain::updateFrameTiming  # frame-rate cap: mh4u.ini  fps = 60  (writes sMain+0x30 on entry)
+0x001cbe20 sFestaMain::frame  # main loop iteration: emulated refresh rate for fps above 60
 0x002d1ff4 uBloomFilter::render  # bloom
 0x0059ea20 uMotionBlurFilter::render  # motion blur
 0x001e1ebc uDOFFilter::render  # depth of field

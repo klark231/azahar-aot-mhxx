@@ -25,12 +25,13 @@ struct AotHookCall {
 typedef void (*AotHookFn)(AotHookCall *);
 
 /* set by the host (index = the hook's place in azahar_aot_hook_addrs); null runs the original */
-RECOMP_EXPORT AotHookFn azahar_aot_hooks[13];
+RECOMP_EXPORT AotHookFn azahar_aot_hooks[14];
 RECOMP_EXPORT const uint32_t azahar_aot_hook_abi = AOT_HOOK_ABI;
 RECOMP_EXPORT const uint32_t azahar_aot_hook_call_size = sizeof(AotHookCall);
-RECOMP_EXPORT const uint32_t azahar_aot_hook_count = 13;
-RECOMP_EXPORT const uint32_t azahar_aot_hook_addrs[13] = {
+RECOMP_EXPORT const uint32_t azahar_aot_hook_count = 14;
+RECOMP_EXPORT const uint32_t azahar_aot_hook_addrs[14] = {
     0x0088E120,
+    0x001CBE20,
     0x002D1FF4,
     0x0059EA20,
     0x001E1EBC,
@@ -135,17 +136,18 @@ static void aot_dispatch(Context *ctx, uint32_t index, Code original) {
 }
 
 RECOMP_OVERRIDE(0x0088E120) { aot_dispatch(ctx, 0, RECOMP_ORIGINAL(0x0088E120)); } /* sMain::updateFrameTiming */
-RECOMP_OVERRIDE(0x002D1FF4) { aot_dispatch(ctx, 1, RECOMP_ORIGINAL(0x002D1FF4)); } /* uBloomFilter::render */
-RECOMP_OVERRIDE(0x0059EA20) { aot_dispatch(ctx, 2, RECOMP_ORIGINAL(0x0059EA20)); } /* uMotionBlurFilter::render */
-RECOMP_OVERRIDE(0x001E1EBC) { aot_dispatch(ctx, 3, RECOMP_ORIGINAL(0x001E1EBC)); } /* uDOFFilter::render */
-RECOMP_OVERRIDE(0x002D3294) { aot_dispatch(ctx, 4, RECOMP_ORIGINAL(0x002D3294)); } /* uBokehFilter::render */
-RECOMP_OVERRIDE(0x005A65B8) { aot_dispatch(ctx, 5, RECOMP_ORIGINAL(0x005A65B8)); } /* uRadialBlurFilter::render */
-RECOMP_OVERRIDE(0x002D851C) { aot_dispatch(ctx, 6, RECOMP_ORIGINAL(0x002D851C)); } /* uMultiBlurFilter::render */
-RECOMP_OVERRIDE(0x00257AD0) { aot_dispatch(ctx, 7, RECOMP_ORIGINAL(0x00257AD0)); } /* uHazeFilter::render */
-RECOMP_OVERRIDE(0x002D4688) { aot_dispatch(ctx, 8, RECOMP_ORIGINAL(0x002D4688)); } /* uColorFilter::render */
-RECOMP_OVERRIDE(0x0054D850) { aot_dispatch(ctx, 9, RECOMP_ORIGINAL(0x0054D850)); } /* uCrossFadeFilter::render */
-RECOMP_OVERRIDE(0x0059D130) { aot_dispatch(ctx, 10, RECOMP_ORIGINAL(0x0059D130)); } /* uImagePlaneFilter::render */
-RECOMP_OVERRIDE(0x0046AD7C) { aot_dispatch(ctx, 11, RECOMP_ORIGINAL(0x0046AD7C)); } /* uOutlineFilter::render */
-RECOMP_OVERRIDE(0x004A0F80) { aot_dispatch(ctx, 12, RECOMP_ORIGINAL(0x004A0F80)); } /* uTVNoiseFilter::render */
+RECOMP_OVERRIDE(0x001CBE20) { aot_dispatch(ctx, 1, RECOMP_ORIGINAL(0x001CBE20)); } /* sFestaMain::frame */
+RECOMP_OVERRIDE(0x002D1FF4) { aot_dispatch(ctx, 2, RECOMP_ORIGINAL(0x002D1FF4)); } /* uBloomFilter::render */
+RECOMP_OVERRIDE(0x0059EA20) { aot_dispatch(ctx, 3, RECOMP_ORIGINAL(0x0059EA20)); } /* uMotionBlurFilter::render */
+RECOMP_OVERRIDE(0x001E1EBC) { aot_dispatch(ctx, 4, RECOMP_ORIGINAL(0x001E1EBC)); } /* uDOFFilter::render */
+RECOMP_OVERRIDE(0x002D3294) { aot_dispatch(ctx, 5, RECOMP_ORIGINAL(0x002D3294)); } /* uBokehFilter::render */
+RECOMP_OVERRIDE(0x005A65B8) { aot_dispatch(ctx, 6, RECOMP_ORIGINAL(0x005A65B8)); } /* uRadialBlurFilter::render */
+RECOMP_OVERRIDE(0x002D851C) { aot_dispatch(ctx, 7, RECOMP_ORIGINAL(0x002D851C)); } /* uMultiBlurFilter::render */
+RECOMP_OVERRIDE(0x00257AD0) { aot_dispatch(ctx, 8, RECOMP_ORIGINAL(0x00257AD0)); } /* uHazeFilter::render */
+RECOMP_OVERRIDE(0x002D4688) { aot_dispatch(ctx, 9, RECOMP_ORIGINAL(0x002D4688)); } /* uColorFilter::render */
+RECOMP_OVERRIDE(0x0054D850) { aot_dispatch(ctx, 10, RECOMP_ORIGINAL(0x0054D850)); } /* uCrossFadeFilter::render */
+RECOMP_OVERRIDE(0x0059D130) { aot_dispatch(ctx, 11, RECOMP_ORIGINAL(0x0059D130)); } /* uImagePlaneFilter::render */
+RECOMP_OVERRIDE(0x0046AD7C) { aot_dispatch(ctx, 12, RECOMP_ORIGINAL(0x0046AD7C)); } /* uOutlineFilter::render */
+RECOMP_OVERRIDE(0x004A0F80) { aot_dispatch(ctx, 13, RECOMP_ORIGINAL(0x004A0F80)); } /* uTVNoiseFilter::render */
 
 

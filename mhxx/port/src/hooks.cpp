@@ -423,6 +423,21 @@ void Frame(RCtx* ctx, RFunc original) {
              rd32(ctx, render + SLTRENDER_RENDER_FLAGS));
 }
 
+/// MHXX 0004000000197100: sFestaMain::frame(this) (0x001cbe20), the per-frame method of the sMain
+/// subclass the game runs. MH4U's Frame above reads and writes MH4U-only globals (render flags,
+/// quest overlay, widescreen), so this one only does the parts that are not MH4U-specific: more
+/// emulated VBlanks for an fps above 60, and one layout refresh once the first frame is up.
+void FrameMhxx(RCtx* ctx, RFunc original) {
+    if (frames == 0 && RefreshRate() > 0) {
+        Core::System::GetInstance().GPU().SetRefreshRate(RefreshRate());
+    }
+    original(ctx);
+    ++frames;
+    if (frames == 1 || frames == 90) {
+        RefreshScreenLayout();
+    }
+}
+
 /// Whether `camera` is shown on the bottom screen (only top-screen views get widened).
 bool OnBottomScreen(RCtx* ctx, u32 camera) {
     const u32 scamera = rd32(ctx, SCAMERA_INSTANCE);
@@ -1392,6 +1407,7 @@ struct Hook {
 constexpr Hook HOOKS[] = {
     {0x006442f8, "sMain::updateFrameTiming", UpdateFrameTiming},
     {0x0088e120, "sMain::updateFrameTiming", UpdateFrameTiming},  // MHXX
+    {0x001cbe20, "sFestaMain::frame", FrameMhxx},  // MHXX
     {0x00af5250, "sMhMain::frame", Frame},
     {0x00c46380, "uMhCamera::getProjMatrix", GetProjMatrix},
     {0x002535f8, "uFreeCamera::getProjMatrix", GetProjMatrix},
