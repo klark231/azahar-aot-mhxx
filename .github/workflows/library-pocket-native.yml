@@ -1,0 +1,111 @@
+name: library-pocket-native
+
+# For the azahar-aot-mhxx repo (MHXX, title 0004000000197100). Builds the game's title.so for
+# POCKET NATIVE (ABI 5 + fastmem, not the azahar-aot library), using
+# pocket-native's own kit (scripts/build.sh) on your OWN dump kept as an asset of a
+# release in this PRIVATE repository: game.3ds, or its parts game.3ds.part-00, -01 ... as you already
+# upload them (joined here). Decrypted, or with aes_keys.txt in the same release. update.cia is NOT
+# used: pocket-native builds from the base game only. .cxi is not supported by the kit.
+#
+# Setup: only save this file as .github/workflows/library-pocket-native.yml. The kit is cloned from
+# github.com/whovian64/pocket-native when the workflow runs (nothing to copy into this repo).
+#
+# Output (artifact "pocket-native-code"): <TITLEID>/title.so and <TITLEID>/sysdata/shared_font.bin.
+# game.3ds is NOT in the artifact (a 4 GB file would blow the Actions storage quota). On the phone put
+# title.so next to the SAME base game.3ds, in a folder, and use  Add game > A folder the kit built:
+#     <anything>/game.3ds
+#     <anything>/title.so
+#     <anything>/sysdata/shared_font.bin     (optional)
+# Manual runs only; never commit the output or attach it to a release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release (not draft) that holds the game dump"
+        default: "game-data"
+      pocket_native_ref:
+        description: "pocket-native tag or branch to build with. Use the tag of the app version you installed (menu top shows it, e.g. v0.5.0); empty = latest default branch"
+        default: ""
+      use_hints:
+        description: "Also feed hints/<TITLEID>.hints (places Azahar-AOT interpreted) to the recompiler. Those were found with the update merged, so try false first"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  lib:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space (the dump, its copies and the build are large)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Get pocket-native's kit from GitHub (public repo, nothing to copy into this one)
+        run: |
+          git clone --depth 1 ${{ inputs.pocket_native_ref != '' && format('--branch {0}', inputs.pocket_native_ref) || '' }} \
+            https://github.com/whovian64/pocket-native.git "$RUNNER_TEMP/pocket-native"
+          test -f "$RUNNER_TEMP/pocket-native/scripts/build.sh"
+          echo "KIT=$RUNNER_TEMP/pocket-native" >> "$GITHUB_ENV"
+          git -C "$RUNNER_TEMP/pocket-native" log -1 --format='kit at %h %s'
+
+      - name: Fetch your dump from the private release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          gh release download "${{ inputs.release_tag }}" --pattern 'game.*' --pattern 'aes_keys.txt' --dir data || \
+            gh release download "${{ inputs.release_tag }}" --pattern 'game.*' --dir data
+          for base in game.3ds game.cia; do
+            if ls data/$base.part-* >/dev/null 2>&1; then
+              cat data/$base.part-* > data/$base
+              rm data/$base.part-*
+            fi
+          done
+          ls -l data
+          if ls data/game.cxi >/dev/null 2>&1; then echo "game.cxi is not supported by pocket-native's kit; use game.3ds or game.cia"; exit 1; fi
+
+      - name: Mark plain dumps as decrypted (leftover encryption flags)
+        run: python3 -I tools/fix_dump_flags.py data/game.*
+
+      - name: Build with pocket-native's kit (container build, long)
+        run: |
+          GAME="$(ls data/game.* | head -n1)"
+          KEYS=()
+          [ -f data/aes_keys.txt ] && KEYS=(--keys data/aes_keys.txt)
+          mkdir -p out
+          if [ "${{ inputs.use_hints }}" = "true" ] && ls hints/*.hints >/dev/null 2>&1; then
+            for h in hints/*.hints; do
+              d="out/Pocket Native/pocket-native/games/$(basename "$h" .hints)"
+              mkdir -p "$d" && cp -v "$h" "$d/title.hints"
+            done
+          fi
+          bash "$KIT/scripts/build.sh" "$GAME" "${KEYS[@]}" --out "$PWD/out"
+
+      - name: Collect title.so and the font (not the game itself)
+        run: |
+          mkdir -p result
+          for g in out/"Pocket Native"/pocket-native/games/*/; do
+            id=$(basename "$g")
+            mkdir -p "result/$id/sysdata"
+            cp "$g/title.so" "result/$id/title.so"
+            cp "$g/sysdata/shared_font.bin" "result/$id/sysdata/"
+          done
+          find result -type f -exec ls -l {} \;
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pocket-native-code
+          path: result
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Remove game data from the runner
+        if: always()
+        run: sudo rm -rf data out result
